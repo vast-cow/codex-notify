@@ -38,7 +38,3 @@ Notifications indicate a completed agent turn; they do not guarantee task succes
 - [How it works and limitations](docs/internals.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Security and privacy](docs/security.md)
-
-## License
-
-No license has been specified for this project.
