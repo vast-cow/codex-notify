@@ -14,7 +14,9 @@
     "include_project": true,
     "include_input": true,
     "include_output": true,
-    "max_output_length": 1000,
+    "truncate_enabled": true,
+    "max_output_length": 140,
+    "thread_url_template": "",
     "timeout_seconds": 10
   }
 }

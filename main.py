@@ -54,7 +54,12 @@ def format_message(event, config):
     options = config.get("notification", {})
 
     title = options.get("title", "Codex CLI")
-    max_length = options.get("max_output_length", 1000)
+    max_length = options.get("max_output_length", 140)
+
+    def body_text(text):
+        if options.get("truncate_enabled", True):
+            return truncate(text, max_length)
+        return str(text or "")
 
     lines = [f"✅ {title} - Task done"]
 
@@ -70,7 +75,7 @@ def format_message(event, config):
             input_text = "\n".join(str(item) for item in inputs)
             lines.append(
                 "\n📝 Request:\n"
-                + truncate(input_text, max_length)
+                + body_text(input_text)
             )
 
     if options.get("include_output", True):
@@ -78,8 +83,19 @@ def format_message(event, config):
         if output:
             lines.append(
                 "\n📋 Result:\n"
-                + truncate(output, max_length)
+                + body_text(output)
             )
+
+    template = options.get("thread_url_template", "")
+    thread_id = event.get("thread-id")
+    if (
+        isinstance(template, str)
+        and template.strip()
+        and isinstance(thread_id, str)
+        and thread_id.strip()
+    ):
+        url = template.replace("{thread_id}", thread_id)
+        lines.append(f"\n🔗 Thread: {url}")
 
     return "\n".join(lines)
 

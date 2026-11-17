@@ -2,6 +2,16 @@
 
 [Back to README](../README.md)
 
+## Automated Tests
+
+Run the standard-library test suite from the repository root:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Delivery is mocked; these tests never send real Telegram or Slack messages or read your local credentials.
+
 ## Testing
 
 You can test notifications without running Codex CLI.
