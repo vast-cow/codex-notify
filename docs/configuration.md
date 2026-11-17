@@ -18,6 +18,7 @@ Copy `config.example.json` to `config.json` in the repository root and edit it w
   "notification": {
     "title": "Codex CLI",
     "include_project": true,
+    "excluded_project_paths": [],
     "include_input": true,
     "include_output": true,
     "truncate_enabled": true,
@@ -41,6 +42,7 @@ Defaults below apply when a setting is omitted. The example configuration explic
 | `slack.webhook_url` | Slack Incoming Webhook URL | Required if enabled |
 | `notification.title` | Notification title | `Codex CLI` |
 | `notification.include_project` | Include project name and working directory | `true` |
+| `notification.excluded_project_paths` | Project directory paths for which both channels are skipped | `[]` |
 | `notification.include_input` | Include the user request | `true` |
 | `notification.include_output` | Include the final assistant response | `true` |
 | `notification.truncate_enabled` | Truncate the Request and Result bodies | `true` |
@@ -67,6 +69,38 @@ To use only Telegram:
 ```
 
 To use only Slack, set `telegram.enabled` to `false` and `slack.enabled` to `true`.
+
+## Exclude Selected Projects
+
+Set `notification.excluded_project_paths` to an array of non-empty path strings:
+
+```json
+{
+  "notification": {
+    "excluded_project_paths": [
+      "/home/user/projects/project-a",
+      "~/projects/project-b"
+    ]
+  }
+}
+```
+
+The notifier compares the event's full `cwd` path with each entry, regardless of
+`notification.include_project`. Both sides expand `~` using the notifier user's
+home directory and normalize to absolute paths, collapsing `.` and `..` and
+removing trailing separators (except at the filesystem root). Relative paths
+are interpreted against the notifier's working directory. Symlinks are not
+resolved and case is preserved.
+
+Matching is exact after normalization: `/work/app` excludes `/work/app/`, but
+not `/work/app-other` or `/work/app/subdir`. Project names, substrings, prefixes,
+globs, and regular expressions are not used for matching.
+
+An excluded event exits successfully with status `0` before message formatting
+or either Telegram or Slack delivery. An omitted setting or empty array keeps
+normal delivery. Events with a missing or empty `cwd` are not excluded. Invalid
+settings (including a non-array value, non-string entries, and empty or
+whitespace-only strings) are reported as configuration errors.
 
 ## Request and Result Length
 

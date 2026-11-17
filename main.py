@@ -2,6 +2,7 @@
 """Codex CLI completion notifier for Telegram and Slack."""
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -14,6 +15,26 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 def load_config():
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def is_project_excluded(event, config):
+    paths = config.get("notification", {}).get("excluded_project_paths", [])
+    if not isinstance(paths, list) or any(
+        not isinstance(path, str) or not path.strip() for path in paths
+    ):
+        raise ValueError(
+            "notification.excluded_project_paths must be an array of non-empty path strings"
+        )
+
+    cwd = event.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return False
+
+    def normalize(path):
+        return os.path.abspath(os.path.expanduser(path))
+
+    project_path = normalize(cwd)
+    return any(project_path == normalize(path) for path in paths)
 
 
 def post_json(url, payload, timeout=10):
@@ -169,6 +190,8 @@ def main():
 
     try:
         config = load_config()
+        if is_project_excluded(event, config):
+            return 0
         message = format_message(event, config)
         timeout = float(
             config.get("notification", {}).get(

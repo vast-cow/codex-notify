@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -131,6 +132,93 @@ class NotificationFlowTests(unittest.TestCase):
         self.assertEqual(telegram.call_args.args[1], slack.call_args.args[1])
         self.assertIn("r" * 139 + "…", telegram.call_args.args[1])
         self.assertIn(TEMPLATE.replace("{thread_id}", THREAD_ID), slack.call_args.args[1])
+
+    def test_excluded_paths_skip_formatting_and_both_channels(self):
+        for cwd, paths in [
+            ("/work/app", ["/work/app"]),
+            ("/work/app/", ["/work/app"]),
+            ("/work/app", ["/work/app/"]),
+            ("/work/app///", ["/work/./app/"]),
+            ("/work/other/../app", ["/work/app"]),
+            ("/work/app", ["/work/other", "/work/app"]),
+            ("/", ["/"]),
+        ]:
+            for include_project in (True, False):
+                with self.subTest(cwd=cwd, paths=paths, include_project=include_project), \
+                        patch.object(main, "format_message") as formatter:
+                    telegram, slack = self.run_notification(event(cwd=cwd), {
+                        "excluded_project_paths": paths,
+                        "include_project": include_project,
+                    })
+                    formatter.assert_not_called()
+                    telegram.assert_not_called()
+                    slack.assert_not_called()
+
+    def test_nonmatching_paths_deliver_to_both_channels(self):
+        for cwd in ("/work/app-other", "/work/app/subdir", "/other/app", "/work/App"):
+            for include_project in (True, False):
+                with self.subTest(cwd=cwd, include_project=include_project):
+                    telegram, slack = self.run_notification(event(cwd=cwd), {
+                        "excluded_project_paths": ["/work/app"],
+                        "include_project": include_project,
+                    })
+                    telegram.assert_called_once()
+                    slack.assert_called_once()
+
+    def test_omitted_or_empty_exclusions_deliver(self):
+        for options in ({}, {"excluded_project_paths": []}):
+            with self.subTest(options=options):
+                telegram, slack = self.run_notification(event(), options)
+                telegram.assert_called_once()
+                slack.assert_called_once()
+
+    def test_home_directory_expands_on_both_sides(self):
+        with patch.dict(os.environ, {"HOME": "/home/test-user"}):
+            for cwd, path in [
+                ("/home/test-user/projects/app/", "~/projects/app"),
+                ("~/projects/app", "/home/test-user/projects/app/"),
+                ("~/projects/app/", "~/projects/app"),
+            ]:
+                with self.subTest(cwd=cwd, path=path):
+                    telegram, slack = self.run_notification(event(cwd=cwd), {
+                        "excluded_project_paths": [path],
+                    })
+                    telegram.assert_not_called()
+                    slack.assert_not_called()
+
+    def test_missing_or_empty_cwd_is_not_excluded(self):
+        missing = event()
+        del missing["cwd"]
+        for payload in (missing, event(cwd=""), event(cwd=None)):
+            with self.subTest(payload=payload):
+                telegram, slack = self.run_notification(payload, {
+                    "excluded_project_paths": [os.getcwd()],
+                })
+                telegram.assert_called_once()
+                slack.assert_called_once()
+
+    def test_invalid_exclusions_are_configuration_errors(self):
+        for paths in (None, "", "/work/app", {}, 123, True,
+                      [""], ["  "], [None], [123], [True], [[]],
+                      ["/work/app", ""]):
+            for cwd in ("/work/app", ""):
+                with self.subTest(paths=paths, cwd=cwd), \
+                        patch.object(main, "load_config", return_value={
+                            "notification": {"excluded_project_paths": paths},
+                        }), \
+                        patch.object(main.sys, "argv", [
+                            "main.py", json.dumps(event(cwd=cwd)),
+                        ]), \
+                        patch.object(main, "format_message") as formatter, \
+                        patch.object(main, "send_telegram") as telegram, \
+                        patch.object(main, "send_slack") as slack, \
+                        contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(main.main(), 1)
+                    self.assertIn("Configuration error:", stderr.getvalue())
+                    self.assertIn("notification.excluded_project_paths", stderr.getvalue())
+                    formatter.assert_not_called()
+                    telegram.assert_not_called()
+                    slack.assert_not_called()
 
     def test_senders_preserve_plain_text_url(self):
         message = main.format_message(event(), {"notification": {

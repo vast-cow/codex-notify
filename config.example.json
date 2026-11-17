@@ -12,6 +12,7 @@
   "notification": {
     "title": "Codex CLI",
     "include_project": true,
+    "excluded_project_paths": [],
     "include_input": true,
     "include_output": true,
     "truncate_enabled": true,

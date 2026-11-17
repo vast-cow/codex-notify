@@ -26,10 +26,11 @@ The notifier processes the event as follows:
 1. Parse the JSON event received from Codex CLI.
 2. Verify that the event type is `agent-turn-complete`.
 3. Load notification settings from `config.json`.
-4. Format the completion message, limiting each Request and Result body independently when truncation is enabled, and adding an optional thread URL.
-5. Send the message to Telegram if enabled.
-6. Send the message to Slack if enabled.
-7. Report notification errors to standard error.
+4. Validate `notification.excluded_project_paths` and exit successfully if the normalized event `cwd` exactly matches an entry (see [matching rules](configuration.md#exclude-selected-projects)).
+5. Format the completion message, limiting each Request and Result body independently when truncation is enabled, and adding an optional thread URL.
+6. Send the message to Telegram if enabled.
+7. Send the message to Slack if enabled.
+8. Report notification errors to standard error.
 
 Telegram and Slack are handled independently. A failure in one channel does not prevent the other from being attempted.
 
@@ -37,6 +38,7 @@ Telegram and Slack are handled independently. A failure in one channel does not 
 
 This project uses only Python standard-library modules:
 
+- `os`
 - `json`
 - `sys`
 - `pathlib`
