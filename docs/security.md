@@ -4,11 +4,10 @@
 
 `config.json` contains sensitive credentials, including Telegram Bot Tokens and Slack Webhook URLs.
 
-Restrict access to the configuration file:
+Restrict access to the configuration file. From the repository root:
 
 ```bash
-chmod 700 ~/.codex/hooks
-chmod 600 ~/.codex/hooks/config.json
+chmod 600 config.json
 ```
 
 If the files are stored in a Git repository, add the following to `.gitignore`:

@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-Create `~/.codex/hooks/config.json`:
+Copy `config.example.json` to `config.json` in the repository root and edit it with your credentials and channel settings. Keep `config.json` alongside `main.py` in your local checkout:
 
 ```json
 {

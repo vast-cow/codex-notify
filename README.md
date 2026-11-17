@@ -10,23 +10,26 @@ A Python hook that sends Codex CLI turn completion notifications to Telegram and
 
 ## Quick Start
 
-From the repository root:
+Clone the repository into any directory you choose. For example, `~/projects/codex-notify` is an optional installation directory:
 
 ```bash
-mkdir -p ~/.codex/hooks
-cp main.py ~/.codex/hooks/notify.py
-cp config.example.json ~/.codex/hooks/config.json
+mkdir -p ~/projects
+git clone https://github.com/vast-cow/codex-notify.git ~/projects/codex-notify
+cd ~/projects/codex-notify
+cp config.example.json config.json
 ```
 
-Edit the copied `config.json` with your credentials and disable any unused channel. See the [setup guide](docs/setup.md) for Telegram and Slack setup.
+Edit `config.json` in the repository root with your credentials and channel settings, and disable any unused channel. See the [setup guide](docs/setup.md) for Telegram and Slack setup.
 
-Add this at the top level of `~/.codex/config.toml`, replacing the path with your absolute home directory:
+Add this at the top level of `~/.codex/config.toml`:
 
 ```toml
-notify = ["python3", "/home/YOUR_USER/.codex/hooks/notify.py"]
+notify = ["python3", "/absolute/path/to/codex-notify/main.py"]
 ```
 
-On macOS, use `/Users/YOUR_USER` instead. Keep `config.json` next to the installed script and protect its credentials as described in the [security guide](docs/security.md).
+Replace `/absolute/path/to/codex-notify` with the actual absolute path to your local checkout. For the example above, run `pwd` from the repository root to find that path, such as `/home/alice/projects/codex-notify` on Linux or `/Users/alice/projects/codex-notify` on macOS.
+
+Codex CLI runs `main.py` directly from the checkout. Keep `config.json` alongside `main.py` in the repository root and protect its credentials as described in the [security guide](docs/security.md).
 
 Notifications indicate a completed agent turn; they do not guarantee task success. See [testing and event behavior](docs/usage.md) for a manual test.
 

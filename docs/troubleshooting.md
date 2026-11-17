@@ -26,9 +26,9 @@ Verify that:
 Verify that:
 
 - `notify` is configured at the top level of `~/.codex/config.toml`.
-- The Python script path is absolute and correct.
+- The Python script path is absolute and points to `main.py` in your local checkout.
 - Python 3 is installed and available.
-- `config.json` exists next to `notify.py`.
+- `config.json` exists alongside `main.py` in the repository root.
 - The Codex CLI version supports the `notify` configuration.
 - The current Codex agent turn has completed.
 

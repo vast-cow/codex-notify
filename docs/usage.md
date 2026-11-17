@@ -6,10 +6,10 @@
 
 You can test notifications without running Codex CLI.
 
-Execute:
+Execute the following command, replacing `/absolute/path/to/codex-notify` with the actual absolute path to your local checkout. Keep your configured `config.json` alongside `main.py` in that checkout:
 
 ```bash
-python3 ~/.codex/hooks/notify.py '{
+python3 "/absolute/path/to/codex-notify/main.py" '{
   "type": "agent-turn-complete",
   "thread-id": "test-session",
   "turn-id": "test-turn",
