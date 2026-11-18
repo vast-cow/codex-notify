@@ -2,10 +2,12 @@ import contextlib
 import io
 import json
 import os
+import sys
 import unittest
 from unittest.mock import patch
 
 import main
+from app_server import ThreadMetadata
 
 
 THREAD_ID = "01a1e7bc-7698-7420-bf3e-34533b790e55"
@@ -228,6 +230,103 @@ class NotificationFlowTests(unittest.TestCase):
             self.assertEqual(post.call_args.args[1]["text"], message)
             main.send_slack({"enabled": True, "webhook_url": "https://example.test"}, message, 10)
             self.assertEqual(post.call_args.args[1]["text"], message)
+
+
+class AppServerFlowTests(unittest.TestCase):
+    def run_notification(self, app_options, metadata, *, payload=None, exclude=False):
+        payload = event() if payload is None else payload
+        config = {
+            "app_server": {"enabled": True, **app_options},
+            "telegram": {"enabled": True},
+            "slack": {"enabled": True},
+            "notification": {"excluded_project_paths": [payload["cwd"]]} if exclude else {},
+        }
+        with patch.object(main, "load_config", return_value=config), \
+                patch.object(sys, "argv", ["main.py", json.dumps(payload)]), \
+                patch.object(main.app_server, "lookup_thread", return_value=metadata) as lookup, \
+                patch.object(main, "format_message", wraps=main.format_message) as formatter, \
+                patch.object(main, "send_telegram") as telegram, \
+                patch.object(main, "send_slack") as slack, \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            status = main.main()
+        self.assertEqual(formatter.call_count, telegram.call_count)
+        self.assertEqual(telegram.call_count, slack.call_count)
+        if lookup.called:
+            lookup.assert_called_once()
+            self.assertEqual(lookup.call_args.args[1], payload)
+        return status, telegram.call_count, lookup.call_count, stdout.getvalue() + stderr.getvalue()
+
+    def test_disabled_does_not_use_websocket_dependency(self):
+        with patch.dict(sys.modules, {"websockets": None, "websockets.asyncio.client": None}):
+            status, delivered, lookups, log = self.run_notification({"enabled": False}, None)
+        self.assertEqual((status, delivered, lookups), (0, 1, 0))
+        self.assertNotIn("app-server", log)
+
+    def test_project_exclusions_precede_lookup(self):
+        status, delivered, lookups, _ = self.run_notification({}, None, exclude=True)
+        self.assertEqual((status, delivered, lookups), (0, 0, 0))
+
+    def test_one_lookup_for_both_channels_on_normal_thread(self):
+        status, delivered, lookups, log = self.run_notification({}, ThreadMetadata(False, False))
+        self.assertEqual((status, delivered, lookups), (0, 1, 1))
+        self.assertIn("proceeding with notification", log)
+
+    def test_confirmed_exclusion_wins_over_unknown_for_all_policies(self):
+        for policy in ("notify", "skip", "error"):
+            for kind, metadata in (
+                ("ephemeral", ThreadMetadata(True, None)),
+                ("archived", ThreadMetadata(None, True)),
+                ("ephemeral", ThreadMetadata(True, True)),
+            ):
+                with self.subTest(policy=policy, kind=kind):
+                    status, delivered, lookups, log = self.run_notification(
+                        {"on_lookup_failure": policy}, metadata,
+                    )
+                    self.assertEqual((status, delivered, lookups), (0, 0, 1))
+                    self.assertIn(f"skipped: {kind} thread (thread-id={THREAD_ID})", log)
+
+    def test_exclusion_settings_apply_independently(self):
+        for setting, metadata in (
+            ("skip_ephemeral", ThreadMetadata(True, False)),
+            ("skip_archived", ThreadMetadata(False, True)),
+        ):
+            with self.subTest(setting=setting):
+                status, delivered, lookups, _ = self.run_notification(
+                    {setting: False, "on_lookup_failure": "error"}, metadata,
+                )
+                self.assertEqual((status, delivered, lookups), (0, 1, 1))
+        status, delivered, lookups, _ = self.run_notification(
+            {"skip_ephemeral": False, "skip_archived": False}, None,
+        )
+        self.assertEqual((status, delivered, lookups), (0, 1, 0))
+
+    def test_failure_policies_apply_to_unknown_enabled_properties(self):
+        for policy, expected in (("notify", (0, 1)), ("skip", (0, 0)), ("error", (1, 0))):
+            with self.subTest(policy=policy):
+                status, delivered, lookups, log = self.run_notification(
+                    {"on_lookup_failure": policy},
+                    ThreadMetadata(False, None, failures=["thread/list is unsupported"]),
+                )
+                self.assertEqual((status, delivered), expected)
+                self.assertEqual(lookups, 1)
+                self.assertIn("lookup failed: thread/list is unsupported", log)
+                self.assertIn("lookup unknown: archived state unavailable", log)
+                self.assertIn("proceeding with notification" if policy == "notify" else
+                              f"on_lookup_failure={policy}", log)
+
+    def test_default_is_fail_open_for_missing_metadata(self):
+        status, delivered, lookups, log = self.run_notification({}, ThreadMetadata())
+        self.assertEqual((status, delivered, lookups), (0, 1, 1))
+        self.assertIn("lookup inconclusive; proceeding with notification", log)
+
+    def test_config_error_does_not_reveal_endpoint_credentials(self):
+        status, delivered, lookups, log = self.run_notification(
+            {"endpoint": "ws://user:secret@host:9876"}, None,
+        )
+        self.assertEqual((status, delivered, lookups), (1, 0, 0))
+        self.assertIn("Configuration error: app_server.endpoint", log)
+        self.assertNotIn("secret", log)
 
 
 if __name__ == "__main__":

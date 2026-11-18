@@ -19,5 +19,13 @@
     "max_output_length": 140,
     "thread_url_template": "",
     "timeout_seconds": 10
+  },
+  "app_server": {
+    "enabled": false,
+    "endpoint": "unix:///tmp/codex-app-server.sock",
+    "skip_ephemeral": true,
+    "skip_archived": true,
+    "timeout_seconds": 1.5,
+    "on_lookup_failure": "notify"
   }
 }

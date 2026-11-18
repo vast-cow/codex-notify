@@ -7,6 +7,9 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from uuid import UUID
+
+import app_server
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -35,6 +38,51 @@ def is_project_excluded(event, config):
 
     project_path = normalize(cwd)
     return any(project_path == normalize(path) for path in paths)
+
+
+def app_server_exit_status(event, config):
+    """Return an exit status to suppress delivery, or None to continue."""
+    settings = app_server.Settings.from_config(config.get("app_server", {}))
+    if not settings.enabled or not (settings.skip_ephemeral or settings.skip_archived):
+        return None
+
+    metadata = app_server.lookup_thread(settings, event)
+    required = {}
+    if settings.skip_ephemeral:
+        required["ephemeral"] = metadata.ephemeral
+    if settings.skip_archived:
+        required["archived"] = metadata.archived
+
+    for name, state in required.items():
+        if state is True:
+            # Only log thread IDs in Codex's UUID format.
+            thread_id = event.get("thread-id")
+            suffix = ""
+            if isinstance(thread_id, str):
+                try:
+                    suffix = f" (thread-id={UUID(thread_id)})"
+                except ValueError:
+                    pass
+            print(f"[notify] skipped: {name} thread{suffix}")
+            return 0
+
+    unknown = [name for name, state in required.items() if state is None]
+    if not unknown:
+        print("[notify] app-server check passed; proceeding with notification")
+        return None
+
+    for reason in dict.fromkeys(metadata.failures):
+        print(f"[notify] app-server lookup failed: {reason}", file=sys.stderr)
+    for name in unknown:
+        print(f"[notify] app-server lookup unknown: {name} state unavailable", file=sys.stderr)
+    if settings.on_lookup_failure == "notify":
+        print("[notify] app-server lookup inconclusive; proceeding with notification", file=sys.stderr)
+        return None
+    if settings.on_lookup_failure == "skip":
+        print("[notify] skipped: app-server lookup inconclusive (on_lookup_failure=skip)", file=sys.stderr)
+        return 0
+    print("[notify] skipped: app-server lookup inconclusive (on_lookup_failure=error)", file=sys.stderr)
+    return 1
 
 
 def post_json(url, payload, timeout=10):
@@ -192,6 +240,9 @@ def main():
         config = load_config()
         if is_project_excluded(event, config):
             return 0
+        status = app_server_exit_status(event, config)
+        if status is not None:
+            return status
         message = format_message(event, config)
         timeout = float(
             config.get("notification", {}).get(
