@@ -25,6 +25,14 @@ Copy `config.example.json` to `config.json` in the repository root and edit it w
     "max_output_length": 140,
     "thread_url_template": "",
     "timeout_seconds": 10
+  },
+  "app_server": {
+    "enabled": false,
+    "endpoint": "unix:///tmp/codex-app-server.sock",
+    "skip_ephemeral": true,
+    "skip_archived": true,
+    "timeout_seconds": 1.5,
+    "on_lookup_failure": "notify"
   }
 }
 ```
@@ -49,6 +57,14 @@ Defaults below apply when a setting is omitted. The example configuration explic
 | `notification.max_output_length` | Maximum Unicode code points per Request or Result body, including any ellipsis | `140` |
 | `notification.thread_url_template` | Full thread URL with optional literal `{thread_id}` substitution | `""` (no link) |
 | `notification.timeout_seconds` | HTTP request timeout in seconds | `10` |
+| `app_server.enabled` | Enable app-server filtering | `false` |
+| `app_server.endpoint` | WebSocket listener at `ws://host:port` or an absolute Unix socket at `unix:///path/to/socket` | `unix:///tmp/codex-app-server.sock` |
+| `app_server.skip_ephemeral` | Suppress notifications for confirmed ephemeral threads | `true` |
+| `app_server.skip_archived` | Suppress notifications for confirmed archived threads | `true` |
+| `app_server.timeout_seconds` | Finite positive timeout in seconds for the whole lookup | `1.5` |
+| `app_server.on_lookup_failure` | Action when a required state is unknown. Use `notify`, `skip`, or `error`. | `notify` |
+
+See [app-server filtering](app-server.md) for transport setup, decision rules, and compatibility.
 
 ## Disable a Notification Channel
 

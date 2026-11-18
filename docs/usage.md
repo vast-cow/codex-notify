@@ -10,11 +10,11 @@ Run the standard-library test suite from the repository root:
 python3 -m unittest discover -s tests -v
 ```
 
-Delivery is mocked; these tests never send real Telegram or Slack messages or read your local credentials.
+The tests mock app-server and notification delivery, and run with the Python standard library alone.
 
 ## Testing
 
-You can test notifications without running Codex CLI.
+You can test delivery without running Codex CLI. Set `app_server.enabled` to `false` for this example, or leave `app_server.on_lookup_failure` at its default `notify` to exercise the failure path with a synthetic thread ID.
 
 Execute the following command, replacing `/absolute/path/to/codex-notify` with the actual absolute path to your local checkout. Keep your configured `config.json` alongside `main.py` in that checkout:
 

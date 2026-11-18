@@ -4,7 +4,7 @@ A Python hook that sends Codex CLI turn completion notifications to Telegram and
 
 ## Requirements
 
-- Python 3.8 or later; no third-party packages required
+- Python 3.8 or later. The optional app-server filter uses the `websockets` package.
 - Codex CLI with `notify` hook support
 - A Telegram bot token and chat ID, or a Slack Incoming Webhook URL
 
@@ -33,10 +33,13 @@ Codex CLI runs `main.py` directly from the checkout. Keep `config.json` alongsid
 
 Notifications indicate a completed agent turn; they do not guarantee task success. See [testing and event behavior](docs/usage.md) for a manual test.
 
+You can optionally suppress notifications for ephemeral or archived threads by connecting the notifier to an existing Codex app-server. Filtering is disabled by default.
+
 ## Documentation
 
 - [Setup guide](docs/setup.md)
 - [Configuration reference](docs/configuration.md)
+- [App-server filtering](docs/app-server.md)
 - [Testing and event behavior](docs/usage.md)
 - [How it works and limitations](docs/internals.md)
 - [Troubleshooting](docs/troubleshooting.md)
