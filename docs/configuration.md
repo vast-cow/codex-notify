@@ -136,7 +136,7 @@ After project exclusions and the minimum duration check, the notifier reads `thr
 
 The database directory comes from `CODEX_SQLITE_HOME`, then `CODEX_HOME`, with `~/.codex` as the default. The notifier opens `goals_1.sqlite` read-only and falls back to `state_5.sqlite` in the same directory if `goals_1.sqlite` is absent.
 
-When `min_turn_duration_minutes` is `0` and the first lookup finds an active goal, the notifier still waits for the matching turn's completion record. Codex can finalize the goal status after invoking the notification hook. The notifier uses the same one-second session log and 30-second completion limits, then reads the goal status again even if the wait expires. [Codex turn hook](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/session/turn.rs#L824) [Codex goal handling at turn stop](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/ext/goal/src/extension.rs#L314)
+When `min_turn_duration_minutes` is `0` and the first lookup finds an active goal, the notifier still waits for the matching turn's completion record. Codex can finalize the goal status after invoking the notification hook. The notifier uses the same one-second session log and 30-second completion limits, then reads the goal status again even if the wait expires. [Codex turn hook](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/session/turn.rs#L856-L862) [Codex goal handling at turn stop](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/ext/goal/src/extension.rs#L314)
 
 ## Request and Result Length
 
