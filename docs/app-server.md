@@ -69,6 +69,8 @@ These checks verify thread identity. The completion event has no process identif
 
 Use a Codex version that supports your chosen listener and the methods for your enabled filters. Some older versions, including Codex CLI 0.169.0, ignore `includedThreadIds`. Archive membership can still be established by an exact match on the first returned page of the corresponding list. A miss follows the failure policy, as do unavailable methods or metadata, unindexed threads, and threads hidden from ordinary listings. [Thread list ID filters](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#thread-list-id-filters)
 
+The listener must have Codex's `features.goals` enabled for goal lookups. If Codex rejects the request because Goals is disabled, the notifier applies `app_server.on_lookup_failure`. Set `notification.skip_active_goals` to `false` to use the thread filters alone on that listener. [Codex goal request handler](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/app-server/src/request_processors/thread_goal_processor.rs)
+
 ## Security
 
 Use a private Unix socket directory or a trusted loopback TCP listener. Plain `ws://` is unencrypted, and app-server clients can invoke operations beyond metadata reads. Keep the listener off untrusted networks. The notifier supports direct connections through these transports without authentication headers. It sends the thread ID to the server and keeps prompts, responses, and credentials out of filter diagnostics.
