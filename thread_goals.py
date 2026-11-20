@@ -3,6 +3,7 @@
 import os
 from contextlib import closing
 from pathlib import Path
+from stat import S_ISREG
 
 import session_logs
 
@@ -17,13 +18,23 @@ def _goal_status(thread_id):
         sqlite_home = Path(
             os.environ.get("CODEX_SQLITE_HOME") or os.environ.get("CODEX_HOME") or "~/.codex"
         ).expanduser()
-        path = sqlite_home / "goals_1.sqlite"
         try:
-            path.stat()
+            path = (sqlite_home / "goals_1.sqlite").resolve(strict=True)
         except FileNotFoundError:
-            path = sqlite_home / "state_5.sqlite"
+            path = (sqlite_home / "state_5.sqlite").resolve(strict=True)
 
-        uri = f"{path.absolute().as_uri()}?mode=ro"
+        if not path.is_file():
+            return None
+        # SQLite opens companion files itself, and opening a named pipe can block.
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                mode = path.with_name(path.name + suffix).stat().st_mode
+            except FileNotFoundError:
+                continue
+            if not S_ISREG(mode):
+                return None
+
+        uri = f"{path.as_uri()}?mode=ro"
         with closing(sqlite3.connect(uri, uri=True, timeout=0)) as connection:
             row = connection.execute(
                 "SELECT status FROM thread_goals WHERE thread_id = ?", (thread_id,),

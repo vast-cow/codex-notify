@@ -299,6 +299,34 @@ class ActiveGoalFilterTests(LocalFilterTestCase):
         self.assert_skipped(self.run_notification(), "skipped: active goal")
         self.assertFalse((self.codex_home / "goals_1.sqlite").exists())
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
+    def test_named_pipes_at_database_paths_allow_delivery_without_opening(self):
+        current = self.codex_home / "goals_1.sqlite"
+        legacy = self.write_goals((THREAD_ID, "active"), path=self.codex_home / "state_5.sqlite")
+        options = {"min_turn_duration_minutes": 0}
+        with patch.object(sqlite3, "connect", side_effect=AssertionError):
+            os.mkfifo(current)
+            self.assert_delivered(self.run_notification(options=options))
+
+            current.unlink()
+            legacy.unlink()
+            os.mkfifo(legacy)
+            self.assert_delivered(self.run_notification(options=options))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
+    def test_named_pipes_at_database_companion_paths_allow_delivery_without_opening(self):
+        database = self.write_goals((THREAD_ID, "active"))
+        options = {"min_turn_duration_minutes": 0}
+        with patch.object(sqlite3, "connect", side_effect=AssertionError):
+            for suffix in ("-journal", "-wal", "-shm"):
+                with self.subTest(suffix=suffix):
+                    companion = database.with_name(database.name + suffix)
+                    os.mkfifo(companion)
+                    try:
+                        self.assert_delivered(self.run_notification(options=options))
+                    finally:
+                        companion.unlink()
+
     def test_sqlite_home_takes_precedence_over_codex_home_and_default(self):
         self.codex_home = self.directory / ".codex"
         self.write_goals((THREAD_ID, "active"))
