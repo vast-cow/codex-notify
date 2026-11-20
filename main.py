@@ -7,6 +7,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from pathlib import Path
 from uuid import UUID
@@ -16,11 +17,23 @@ import session_logs
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+MIN_TURN_DURATION_KEY = "min_turn_duration_minutes"
+
+
+def _decode_config_object(options):
+    # Keep the threshold's decimal precision and preserve float behavior for other settings.
+    for key, value in options.items():
+        if key != MIN_TURN_DURATION_KEY and isinstance(value, Decimal):
+            options[key] = float(value)
+    return options
 
 
 def load_config():
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        try:
+            return json.load(f, parse_float=Decimal, object_hook=_decode_config_object)
+        except InvalidOperation as error:
+            raise ValueError("invalid number in config.json") from error
 
 
 def is_project_excluded(event, config):
@@ -44,10 +57,11 @@ def is_project_excluded(event, config):
 
 
 def is_turn_duration_filtered(event, config):
-    minutes = config.get("notification", {}).get("min_turn_duration_minutes", 1)
+    minutes = config.get("notification", {}).get(MIN_TURN_DURATION_KEY, 1)
     if (
-        type(minutes) not in (int, float)
+        type(minutes) not in (int, float, Decimal)
         or (type(minutes) is float and not math.isfinite(minutes))
+        or (type(minutes) is Decimal and not minutes.is_finite())
         or minutes < 0
     ):
         raise ValueError("notification.min_turn_duration_minutes must be a finite non-negative number")
@@ -60,8 +74,11 @@ def is_turn_duration_filtered(event, config):
         print(f"[notify] skipped: turn duration is unknown ({error})")
         return True
 
-    # Compare in milliseconds without rounding decimal thresholds to a float.
-    if duration_ms < Fraction(str(minutes)) * 60_000:
+    # One millisecond meets any positive threshold below 0.00001 minutes.
+    # The bounds avoid constructing fractions for extreme exponents.
+    if duration_ms == 0 or minutes > duration_ms or (
+        minutes >= Decimal("0.00001") and duration_ms < Fraction(str(minutes)) * 60_000
+    ):
         print(f"[notify] skipped: turn duration {duration_ms} ms is below the {minutes}-minute minimum")
         return True
     return False

@@ -132,6 +132,28 @@ class DurationFilterTests(unittest.TestCase):
                 )
                 self.assertEqual(self.elapsed, 0)
 
+    def test_threshold_preserves_decimal_precision_from_config(self):
+        for literal, duration_ms, skipped in (
+            ("1.00000000000000001", 60_000, True),
+            ("1e-400", 0, True), ("1e-400", 1, False),
+        ):
+            with self.subTest(literal=literal, duration_ms=duration_ms), \
+                    patch.object(main, "CONFIG_PATH", self.config_path), \
+                    patch.object(session_logs, "turn_duration_ms", return_value=duration_ms), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.config_path.write_text(
+                    '{"notification": {"min_turn_duration_minutes": ' + literal + '}}',
+                    encoding="utf-8",
+                )
+                self.assertEqual(main.is_turn_duration_filtered(EVENT, main.load_config()), skipped)
+
+        self.config_path.write_text(
+            '{"notification": {"min_turn_duration_minutes": -1e-400}}', encoding="utf-8",
+        )
+        with patch.object(main, "CONFIG_PATH", self.config_path):
+            with self.assertRaisesRegex(ValueError, "notification.min_turn_duration_minutes"):
+                main.is_turn_duration_filtered(EVENT, main.load_config())
+
     def test_project_exclusion_precedes_log_lookup(self):
         with patch.object(session_logs, "turn_duration_ms", side_effect=AssertionError):
             self.assert_skipped(self.run_notification(options={
