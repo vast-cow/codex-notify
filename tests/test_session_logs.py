@@ -336,6 +336,22 @@ class ActiveGoalFilterTests(LocalFilterTestCase):
         os.mkfifo(database.with_name(database.name + "-shm"))
         self.assert_skipped(self.run_notification(), "skipped: active goal")
 
+    def test_unused_shared_memory_stat_error_preserves_active_goal_suppression(self):
+        database = self.write_goals((THREAD_ID, "active")).resolve()
+        with contextlib.closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode=DELETE").fetchone(), ("delete",))
+        self.write_log(completion(60_000))
+        shared_memory = database.with_name(database.name + "-shm")
+        stat = Path.stat
+
+        def stat_with_error(path, *args, **kwargs):
+            if path == shared_memory:
+                raise OSError("could not read shared-memory file metadata")
+            return stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", stat_with_error):
+            self.assert_skipped(self.run_notification(), "skipped: active goal")
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
     def test_shared_memory_pipe_with_wal_allows_delivery_without_opening(self):
         for mode in ("wal", "delete"):

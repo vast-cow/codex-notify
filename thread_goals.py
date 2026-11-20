@@ -37,12 +37,12 @@ def _goal_status(thread_id):
         # SQLite opens companion files itself, and opening a named pipe can block.
         for suffix in ("-journal", "-wal", "-shm"):
             try:
-                mode = path.with_name(path.name + suffix).stat().st_mode
+                is_regular = S_ISREG(path.with_name(path.name + suffix).stat().st_mode)
             except FileNotFoundError:
                 continue
-            if S_ISREG(mode):
-                continue
-            if suffix != "-shm" or not _uses_only_rollback_journal(path):
+            except OSError:
+                is_regular = False
+            if not is_regular and (suffix != "-shm" or not _uses_only_rollback_journal(path)):
                 return None
 
         uri = f"{path.as_uri()}?mode=ro"
