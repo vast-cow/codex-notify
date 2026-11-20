@@ -54,7 +54,7 @@ Defaults below apply when a setting is omitted. The example configuration explic
 | `notification.include_project` | Include project name and working directory | `true` |
 | `notification.excluded_project_paths` | Project directory paths for which both channels are skipped | `[]` |
 | `notification.min_turn_duration_minutes` | Minimum recorded turn duration in minutes for both channels. Set to `0` to disable. | `1` |
-| `notification.skip_active_goals` | Skip both channels while the event's thread has an active goal. Set to `false` to disable. | `true` |
+| `notification.skip_active_goals` | Skip both channels while the event's thread has an active goal. Requires `app_server.enabled`. | `true` |
 | `notification.include_input` | Include the user request | `true` |
 | `notification.include_output` | Include the final assistant response | `true` |
 | `notification.truncate_enabled` | Truncate the Request and Result bodies | `true` |
@@ -65,7 +65,7 @@ Defaults below apply when a setting is omitted. The example configuration explic
 | `app_server.endpoint` | WebSocket listener at `ws://host:port` or an absolute Unix socket at `unix:///path/to/socket` | `unix:///tmp/codex-app-server.sock` |
 | `app_server.skip_ephemeral` | Suppress notifications for confirmed ephemeral threads | `true` |
 | `app_server.skip_archived` | Suppress notifications for confirmed archived threads | `true` |
-| `app_server.timeout_seconds` | Finite positive timeout in seconds for the whole lookup | `1.5` |
+| `app_server.timeout_seconds` | Finite positive timeout in seconds for connection setup and thread metadata, and separately for each goal request | `1.5` |
 | `app_server.on_lookup_failure` | Action when a required state is unknown. Use `notify`, `skip`, or `error`. | `notify` |
 
 See [app-server filtering](app-server.md) for transport setup, decision rules, and compatibility.
@@ -130,13 +130,13 @@ The notifier reads the matching thread and turn's `duration_ms` from Codex's JSO
 
 ## Active Goal Filtering
 
-`notification.skip_active_goals` defaults to `true`, including in existing configurations that omit it. Set it to `false` to disable the goal lookup and its completion wait. The setting accepts only JSON booleans.
+The notifier checks goals only when `app_server.enabled` and `notification.skip_active_goals` are both `true`. `notification.skip_active_goals` accepts only JSON booleans and defaults to `true`, including in existing configurations that omit it. To keep active goal filtering when upgrading with app-server integration disabled, [configure and enable the app-server](app-server.md#setup).
 
-After project exclusions and the minimum duration check, the notifier reads `thread_goals.status` for the event's thread. It skips both Telegram and Slack and exits with status `0` when the goal is `active`. The usual filters apply to completed, paused, stalled, budget-limited, and usage-limited goals. They also apply when the goal is missing, the database is unreadable, or Python lacks SQLite support.
+After project exclusions and the minimum duration check, the notifier uses `thread/goal/get` on the same app-server connection as the thread metadata checks. It skips both Telegram and Slack and exits with status `0` when the goal belongs to the event's thread and its status is `active`. An explicit `null` goal and the other goal statuses allow delivery if the other filters pass.
 
-The database directory comes from `CODEX_SQLITE_HOME`, then `CODEX_HOME`, with `~/.codex` as the default. The notifier opens `goals_1.sqlite` read-only and falls back to `state_5.sqlite` in the same directory if `goals_1.sqlite` is absent.
+Connection failures, unsupported requests, invalid responses, and mismatched thread IDs leave the goal state unknown. Confirmed ephemeral or archived exclusions still take precedence. Otherwise `app_server.on_lookup_failure` applies. The default `notify` continues notification processing, `skip` suppresses both channels with status `0`, and `error` suppresses both with status `1`.
 
-When `min_turn_duration_minutes` is `0` and the first lookup finds an active goal, the notifier still waits for the matching turn's completion record. Codex can finalize the goal status after invoking the notification hook. The notifier uses the same one-second session log and 30-second completion limits, then reads the goal status again even if the wait expires. [Codex turn hook](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/session/turn.rs#L856-L862) [Codex goal handling at turn stop](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/ext/goal/src/extension.rs#L314)
+When `min_turn_duration_minutes` is `0` and the first lookup finds an active goal, the notifier waits for the matching turn's completion record. Codex can finalize the goal status after invoking the notification hook. The notifier uses the same one-second session log and 30-second completion limits, then makes a second goal request even if the wait expires. The second response determines the goal state. Each goal request has its own `app_server.timeout_seconds` deadline. [Codex turn hook](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/session/turn.rs#L856-L862) [Codex goal handling at turn stop](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/ext/goal/src/extension.rs#L314)
 
 ## Request and Result Length
 

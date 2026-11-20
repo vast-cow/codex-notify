@@ -35,7 +35,7 @@ Notifications indicate a completed agent turn; they do not guarantee task succes
 
 By default, Telegram and Slack notify for turns that took at least one minute and have a recorded duration. See [turn duration filtering](docs/configuration.md#minimum-turn-duration) to change the threshold or disable the filter.
 
-Both channels also skip turns while a goal is active in the event's thread. See [active goal filtering](docs/configuration.md#active-goal-filtering) for details.
+Both channels skip turns with an active goal when `app_server.enabled` and `notification.skip_active_goals` are both `true`. If the goal state is unknown, notifications proceed by default. To keep active goal filtering when upgrading with app-server integration disabled, configure and enable it. See [active goal filtering](docs/configuration.md#active-goal-filtering) for details.
 
 You can optionally suppress notifications for ephemeral or archived threads by connecting the notifier to an existing Codex app-server. App-server filtering is disabled by default.
 

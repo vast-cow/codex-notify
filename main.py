@@ -9,12 +9,12 @@ import urllib.error
 import urllib.request
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
 import app_server
 import session_logs
-import thread_goals
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -85,13 +85,28 @@ def is_turn_duration_filtered(event, config):
     return False
 
 
-def app_server_exit_status(event, config):
+def _wait_for_turn_completion(event):
+    # The hook can run before Codex finalizes the goal and records the turn completion.
+    try:
+        session_logs.turn_completion(event)
+    except session_logs.DurationUnavailable:
+        pass
+
+
+def app_server_exit_status(event, config, *, skip_active_goals):
     """Return an exit status to suppress delivery, or None to continue."""
     settings = app_server.Settings.from_config(config.get("app_server", {}))
-    if not settings.enabled or not (settings.skip_ephemeral or settings.skip_archived):
+    if not settings.enabled or not (
+        settings.skip_ephemeral or settings.skip_archived or skip_active_goals
+    ):
         return None
 
-    metadata = app_server.lookup_thread(settings, event)
+    wait_for_turn = None
+    if skip_active_goals and config.get("notification", {}).get(MIN_TURN_DURATION_KEY) == 0:
+        wait_for_turn = partial(_wait_for_turn_completion, event)
+    metadata = app_server.lookup_thread(
+        settings, event, check_goal=skip_active_goals, wait_for_turn=wait_for_turn,
+    )
     required = {}
     if settings.skip_ephemeral:
         required["ephemeral"] = metadata.ephemeral
@@ -110,6 +125,12 @@ def app_server_exit_status(event, config):
                     pass
             print(f"[notify] skipped: {name} thread{suffix}")
             return 0
+
+    if skip_active_goals:
+        if metadata.active_goal is True:
+            print("[notify] skipped: active goal")
+            return 0
+        required["goal"] = metadata.active_goal
 
     unknown = [name for name, state in required.items() if state is None]
     if not unknown:
@@ -291,12 +312,7 @@ def main():
             return 0
         if is_turn_duration_filtered(event, config):
             return 0
-        if skip_active_goals and thread_goals.is_active(
-            event, wait_for_completion=options.get(MIN_TURN_DURATION_KEY) == 0,
-        ):
-            print("[notify] skipped: active goal")
-            return 0
-        status = app_server_exit_status(event, config)
+        status = app_server_exit_status(event, config, skip_active_goals=skip_active_goals)
         if status is not None:
             return status
         message = format_message(event, config)

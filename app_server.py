@@ -8,7 +8,7 @@ import math
 import os
 import socket
 from concurrent.futures import Future
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import List, Optional
@@ -20,6 +20,7 @@ SOURCE_KINDS = (
     "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
     "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
 )
+GOAL_STATUSES = ("active", "paused", "blocked", "usageLimited", "budgetLimited", "complete")
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class ThreadMetadata:
     ephemeral: Optional[bool] = None
     archived: Optional[bool] = None
     failures: List[str] = field(default_factory=list)
+    active_goal: Optional[bool] = None
 
 
 class AppServerError(Exception):
@@ -230,79 +232,108 @@ def _check_thread(thread, thread_id, *expected_cwds):
     return cwd
 
 
-async def _query(settings, thread_id, event_cwd, metadata, deadline):
-    async with _connect(settings.endpoint) as connection:
-        rpc = RpcClient(connection, deadline)
-        initialized = await rpc.request("initialize", {
-            "clientInfo": {"name": "codex-notify", "version": "1.0"},
-        })
-        if not isinstance(initialized, dict) or not isinstance(
-            initialized.get("userAgent"), str
-        ) or not initialized["userAgent"].strip():
-            raise AppServerError("incompatible initialize response (missing userAgent)")
-        await rpc.send({"method": "initialized"})
+async def _query_metadata(rpc, settings, thread_id, event_cwd, metadata):
+    initialized = await rpc.request("initialize", {
+        "clientInfo": {"name": "codex-notify", "version": "1.0"},
+    })
+    if not isinstance(initialized, dict) or not isinstance(
+        initialized.get("userAgent"), str
+    ) or not initialized["userAgent"].strip():
+        raise AppServerError("incompatible initialize response (missing userAgent)")
+    await rpc.send({"method": "initialized"})
 
-        read_cwd = None
-        if settings.skip_ephemeral:
+    read_cwd = None
+    if settings.skip_ephemeral:
+        try:
+            result = await rpc.request("thread/read", {
+                "threadId": thread_id, "includeTurns": False,
+            })
+        except RpcError as exc:
+            metadata.failures.append(str(exc))
+        else:
+            thread = result.get("thread") if isinstance(result, dict) else None
+            if isinstance(thread, dict):
+                read_cwd = _check_thread(thread, thread_id, event_cwd)
+                ephemeral = thread.get("ephemeral")
+                if type(ephemeral) is bool:
+                    metadata.ephemeral = ephemeral
+            else:
+                metadata.failures.append("malformed thread/read result")
+        if metadata.ephemeral is True:
+            return
+
+    if settings.skip_archived:
+        for archived in (True, False):
             try:
-                result = await rpc.request("thread/read", {
-                    "threadId": thread_id, "includeTurns": False,
+                result = await rpc.request("thread/list", {
+                    "archived": archived,
+                    "includedThreadIds": [thread_id],
+                    "sourceKinds": list(SOURCE_KINDS),
+                    "modelProviders": [],
+                    "limit": 1,
                 })
             except RpcError as exc:
                 metadata.failures.append(str(exc))
-            else:
-                thread = result.get("thread") if isinstance(result, dict) else None
-                if isinstance(thread, dict):
-                    read_cwd = _check_thread(thread, thread_id, event_cwd)
-                    ephemeral = thread.get("ephemeral")
-                    if type(ephemeral) is bool:
-                        metadata.ephemeral = ephemeral
-                else:
-                    metadata.failures.append("malformed thread/read result")
-            if metadata.ephemeral is True:
+                # An unsupported method or rejected parameters apply to both queries.
+                if exc.code in (-32601, -32602):
+                    break
+                continue
+            rows = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                metadata.failures.append("malformed thread/list result")
+                continue
+            # Older servers ignore includedThreadIds and may return unrelated rows.
+            matches = [row for row in rows if row.get("id") == thread_id]
+            if matches:
+                for row in matches:
+                    _check_thread(row, thread_id, event_cwd, read_cwd)
+                metadata.archived = archived
                 return
 
-        if settings.skip_archived:
-            for archived in (True, False):
-                try:
-                    result = await rpc.request("thread/list", {
-                        "archived": archived,
-                        "includedThreadIds": [thread_id],
-                        "sourceKinds": list(SOURCE_KINDS),
-                        "modelProviders": [],
-                        "limit": 1,
-                    })
-                except RpcError as exc:
-                    metadata.failures.append(str(exc))
-                    # An unsupported method or rejected parameters apply to both queries.
-                    if exc.code in (-32601, -32602):
-                        break
-                    continue
-                rows = result.get("data") if isinstance(result, dict) else None
-                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                    metadata.failures.append("malformed thread/list result")
-                    continue
-                # Older servers ignore includedThreadIds and may return unrelated rows.
-                matches = [row for row in rows if row.get("id") == thread_id]
-                if matches:
-                    for row in matches:
-                        _check_thread(row, thread_id, event_cwd, read_cwd)
-                    metadata.archived = archived
-                    return
+
+async def _query_goal(rpc, thread_id, timeout):
+    rpc.deadline = asyncio.get_running_loop().time() + timeout
+    result = await asyncio.wait_for(
+        rpc.request("thread/goal/get", {"threadId": thread_id}), timeout=timeout,
+    )
+    if not isinstance(result, dict) or "goal" not in result:
+        raise AppServerError("malformed thread/goal/get result")
+    goal = result["goal"]
+    if goal is None:
+        return False
+    if not isinstance(goal, dict) or goal.get("status") not in GOAL_STATUSES:
+        raise AppServerError("malformed thread/goal/get goal")
+    if goal.get("threadId") != thread_id:
+        raise AppServerError("thread/goal/get thread identity mismatch")
+    return goal["status"] == "active"
 
 
-async def _lookup(settings, thread_id, cwd, metadata):
+async def _lookup(settings, thread_id, cwd, metadata, check_goal, wait_for_turn):
     loop = asyncio.get_running_loop()
     if settings.endpoint.startswith("ws://"):
         loop.getaddrinfo = _getaddrinfo
-    deadline = loop.time() + settings.timeout_seconds
-    await asyncio.wait_for(
-        _query(settings, thread_id, cwd, metadata, deadline),
-        timeout=settings.timeout_seconds,
-    )
+    timeout = settings.timeout_seconds
+    deadline = loop.time() + timeout
+    async with AsyncExitStack() as stack:
+        connection = await asyncio.wait_for(
+            stack.enter_async_context(_connect(settings.endpoint)), timeout=timeout,
+        )
+        rpc = RpcClient(connection, deadline)
+        await asyncio.wait_for(
+            _query_metadata(rpc, settings, thread_id, cwd, metadata),
+            timeout=deadline - loop.time(),
+        )
+
+        if not check_goal or metadata.ephemeral is True or metadata.archived is True:
+            return
+        active_goal = await _query_goal(rpc, thread_id, timeout)
+        if active_goal and wait_for_turn is not None:
+            await loop.run_in_executor(None, wait_for_turn)
+            active_goal = await _query_goal(rpc, thread_id, timeout)
+        metadata.active_goal = active_goal
 
 
-def lookup_thread(settings, event):
+def lookup_thread(settings, event, *, check_goal=False, wait_for_turn=None):
     """Return verified properties, with None for each unavailable property."""
     metadata = ThreadMetadata()
     thread_id = event.get("thread-id")
@@ -312,7 +343,7 @@ def lookup_thread(settings, event):
     cwd = event.get("cwd")
     cwd = cwd if isinstance(cwd, str) and cwd else None
     try:
-        asyncio.run(_lookup(settings, thread_id, cwd, metadata))
+        asyncio.run(_lookup(settings, thread_id, cwd, metadata, check_goal, wait_for_turn))
     except ThreadIdentityError as exc:
         return ThreadMetadata(failures=[str(exc)])
     except (asyncio.TimeoutError, TimeoutError):

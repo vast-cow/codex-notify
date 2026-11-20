@@ -1,11 +1,10 @@
 import contextlib
-import importlib
 import io
 import json
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, DEFAULT, Mock, patch
 
 import main
 from app_server import ThreadMetadata
@@ -13,6 +12,13 @@ from app_server import ThreadMetadata
 
 THREAD_ID = "01a1e7bc-7698-7420-bf3e-34533b790e55"
 TEMPLATE = "http://127.0.0.1:5900/#/thread/{thread_id}"
+
+
+def rpc_response(request_id, result):
+    return json.dumps({"id": request_id, "result": result})
+
+
+INITIALIZE_REPLY = rpc_response(1, {"userAgent": "codex"})
 
 
 def event(**updates):
@@ -96,19 +102,19 @@ class FormattingTests(unittest.TestCase):
 
 
 class NotificationFlowTests(unittest.TestCase):
-    def run_notification(self, payload, options=None, *, notifier=main):
+    def run_notification(self, payload, options=None):
         config = {
             "telegram": {"enabled": True}, "slack": {"enabled": True},
             "notification": {
-                "min_turn_duration_minutes": 0, "skip_active_goals": False, **(options or {}),
+                "min_turn_duration_minutes": 0, **(options or {}),
             },
         }
-        with patch.object(notifier, "load_config", return_value=config), \
+        with patch.object(main, "load_config", return_value=config), \
                 patch.object(sys, "argv", ["main.py", json.dumps(payload)]), \
-                patch.object(notifier, "send_telegram") as telegram, \
-                patch.object(notifier, "send_slack") as slack, \
+                patch.object(main, "send_telegram") as telegram, \
+                patch.object(main, "send_slack") as slack, \
                 contextlib.redirect_stdout(io.StringIO()):
-            status = notifier.main()
+            status = main.main()
         self.assertEqual(status, 0)
         return telegram, slack
 
@@ -116,19 +122,6 @@ class NotificationFlowTests(unittest.TestCase):
         telegram, slack = self.run_notification(event())
         telegram.assert_called_once_with({"enabled": True}, main.format_message(event(), {}), 10)
         slack.assert_called_once_with({"enabled": True}, main.format_message(event(), {}), 10)
-
-    def test_completion_delivers_without_sqlite(self):
-        with patch.dict(sys.modules, {"sqlite3": None}):
-            del sys.modules["main"]
-            del sys.modules["thread_goals"]
-            notifier = importlib.import_module("main")
-            for enabled in (True, False):
-                with self.subTest(skip_active_goals=enabled):
-                    telegram, slack = self.run_notification(
-                        event(), {"skip_active_goals": enabled}, notifier=notifier,
-                    )
-                    telegram.assert_called_once()
-                    slack.assert_called_once()
 
     def test_completion_without_thread_id_still_delivers(self):
         payload = event()
@@ -249,21 +242,25 @@ class NotificationFlowTests(unittest.TestCase):
 
 
 class AppServerFlowTests(unittest.TestCase):
-    def run_notification(self, app_options, metadata, *, payload=None, exclude=False):
+    def run_notification(self, app_options, metadata=DEFAULT, *, payload=None, exclude=False,
+                         notification_options=None):
         payload = event() if payload is None else payload
+        if notification_options is None:
+            notification_options = {"skip_active_goals": False}
         config = {
             "app_server": {"enabled": True, **app_options},
             "telegram": {"enabled": True},
             "slack": {"enabled": True},
             "notification": {
                 "min_turn_duration_minutes": 0,
-                "skip_active_goals": False,
                 "excluded_project_paths": [payload["cwd"]] if exclude else [],
+                **notification_options,
             },
         }
         with patch.object(main, "load_config", return_value=config), \
                 patch.object(sys, "argv", ["main.py", json.dumps(payload)]), \
-                patch.object(main.app_server, "lookup_thread", return_value=metadata) as lookup, \
+                patch.object(main.app_server, "lookup_thread", return_value=metadata,
+                             wraps=main.app_server.lookup_thread) as lookup, \
                 patch.object(main, "format_message", wraps=main.format_message) as formatter, \
                 patch.object(main, "send_telegram") as telegram, \
                 patch.object(main, "send_slack") as slack, \
@@ -279,12 +276,14 @@ class AppServerFlowTests(unittest.TestCase):
 
     def test_disabled_does_not_use_websocket_dependency(self):
         with patch.dict(sys.modules, {"websockets": None, "websockets.asyncio.client": None}):
-            status, delivered, lookups, log = self.run_notification({"enabled": False}, None)
+            status, delivered, lookups, log = self.run_notification(
+                {"enabled": False}, notification_options={},
+            )
         self.assertEqual((status, delivered, lookups), (0, 1, 0))
         self.assertNotIn("app-server", log)
 
     def test_project_exclusions_precede_lookup(self):
-        status, delivered, lookups, _ = self.run_notification({}, None, exclude=True)
+        status, delivered, lookups, _ = self.run_notification({}, exclude=True, notification_options={})
         self.assertEqual((status, delivered, lookups), (0, 0, 0))
 
     def test_one_lookup_for_both_channels_on_normal_thread(self):
@@ -301,7 +300,7 @@ class AppServerFlowTests(unittest.TestCase):
             ):
                 with self.subTest(policy=policy, kind=kind):
                     status, delivered, lookups, log = self.run_notification(
-                        {"on_lookup_failure": policy}, metadata,
+                        {"on_lookup_failure": policy}, metadata, notification_options={},
                     )
                     self.assertEqual((status, delivered, lookups), (0, 0, 1))
                     self.assertIn(f"skipped: {kind} thread (thread-id={THREAD_ID})", log)
@@ -339,6 +338,112 @@ class AppServerFlowTests(unittest.TestCase):
         status, delivered, lookups, log = self.run_notification({}, ThreadMetadata())
         self.assertEqual((status, delivered, lookups), (0, 1, 1))
         self.assertIn("lookup inconclusive; proceeding with notification", log)
+
+    def run_goal_lookup(self, replies, *, app_options=None, **options):
+        connection = Mock(send=AsyncMock(), recv=AsyncMock(side_effect=iter(replies)))
+
+        @contextlib.asynccontextmanager
+        async def connect(endpoint):
+            yield connection
+
+        settings = {"skip_ephemeral": False, "skip_archived": False, **(app_options or {})}
+        with patch.object(main.app_server, "_connect", side_effect=connect) as connect_mock:
+            result = self.run_notification(settings, **options)
+        sent = [json.loads(call.args[0]) for call in connection.send.await_args_list]
+        self.assertEqual(connect_mock.call_count, result[2])
+        return result, sent
+
+    def goal_reply(self, request_id, status):
+        return rpc_response(request_id, {"goal": {"threadId": THREAD_ID, "status": status}})
+
+    def test_goal_filter_requires_both_settings(self):
+        for app_enabled, goal_enabled in ((False, True), (True, False), (False, False)):
+            with self.subTest(app_enabled=app_enabled, goal_enabled=goal_enabled), \
+                    patch.object(main.session_logs, "turn_completion") as wait:
+                result, sent = self.run_goal_lookup(
+                    [], app_options={"enabled": app_enabled},
+                    notification_options={"skip_active_goals": goal_enabled},
+                )
+                self.assertEqual(result[:3], (0, 1, 0))
+                self.assertEqual(sent, [])
+                wait.assert_not_called()
+
+        result, sent = self.run_goal_lookup(
+            [INITIALIZE_REPLY, rpc_response(2, {"goal": None})], notification_options={},
+        )
+        self.assertEqual(result[:3], (0, 1, 1))
+        self.assertEqual(sent[-1]["method"], "thread/goal/get")
+
+    def test_disabling_goal_filter_keeps_enabled_thread_filters(self):
+        result, sent = self.run_goal_lookup([
+            INITIALIZE_REPLY, rpc_response(2, {"thread": {"id": THREAD_ID, "ephemeral": False}}),
+        ], app_options={"skip_ephemeral": True})
+        self.assertEqual(result[:3], (0, 1, 1))
+        self.assertEqual([message["method"] for message in sent], [
+            "initialize", "initialized", "thread/read",
+        ])
+
+    def test_goal_unknown_uses_lookup_failure_policy(self):
+        replies = [INITIALIZE_REPLY, json.dumps({
+            "id": 2, "error": {"code": -32601, "message": "unknown method"},
+        })]
+        for policy, expected in (("notify", (0, 1)), ("skip", (0, 0)), ("error", (1, 0))):
+            with self.subTest(policy=policy):
+                (status, delivered, _, log), _ = self.run_goal_lookup(
+                    replies, app_options={"on_lookup_failure": policy}, notification_options={},
+                )
+                self.assertEqual((status, delivered), expected)
+                self.assertIn("thread/goal/get is unsupported", log)
+                self.assertIn("lookup unknown: goal state unavailable", log)
+
+    def test_positive_minimum_skips_active_goal_without_waiting_again(self):
+        with patch.object(main.session_logs, "turn_duration_ms", return_value=60_000) as duration, \
+                patch.object(main.session_logs, "turn_completion") as wait:
+            result, sent = self.run_goal_lookup([
+                INITIALIZE_REPLY, self.goal_reply(2, "active"),
+            ], notification_options={"min_turn_duration_minutes": 1})
+        duration.assert_called_once_with(event())
+        wait.assert_not_called()
+        self.assertEqual(result[:3], (0, 0, 1))
+        self.assertIn("skipped: active goal", result[3])
+        self.assertEqual([message["method"] for message in sent].count("thread/goal/get"), 1)
+
+    def test_zero_minimum_uses_goal_response_after_wait_even_if_wait_times_out(self):
+        for timed_out in (False, True):
+            for final_status, delivered in (("complete", 1), ("active", 0)):
+                with self.subTest(timed_out=timed_out, final_status=final_status), \
+                        patch.object(main.session_logs, "turn_completion") as wait:
+                    if timed_out:
+                        wait.side_effect = main.session_logs.DurationUnavailable("completion timeout")
+
+                    def replies():
+                        yield INITIALIZE_REPLY
+                        wait.assert_not_called()
+                        yield self.goal_reply(2, "active")
+                        wait.assert_called_once_with(event())
+                        yield self.goal_reply(3, final_status)
+
+                    result, sent = self.run_goal_lookup(replies(), notification_options={})
+                    self.assertEqual(result[:3], (0, delivered, 1))
+                    self.assertEqual(sent[-2:], [
+                        {"id": request_id, "method": "thread/goal/get", "params": {"threadId": THREAD_ID}}
+                        for request_id in (2, 3)
+                    ])
+
+    def test_failed_recheck_uses_default_notify_policy(self):
+        with patch.object(main.session_logs, "turn_completion"):
+            result, _ = self.run_goal_lookup([
+                INITIALIZE_REPLY, self.goal_reply(2, "active"), rpc_response(3, {}),
+            ], notification_options={})
+        self.assertEqual(result[:3], (0, 1, 1))
+        self.assertIn("lookup unknown: goal state unavailable", result[3])
+
+    def test_goal_setting_requires_a_boolean(self):
+        status, delivered, lookups, log = self.run_notification(
+            {}, notification_options={"skip_active_goals": "false"},
+        )
+        self.assertEqual((status, delivered, lookups), (1, 0, 0))
+        self.assertIn("Configuration error: notification.skip_active_goals", log)
 
     def test_config_error_does_not_reveal_endpoint_credentials(self):
         status, delivered, lookups, log = self.run_notification(

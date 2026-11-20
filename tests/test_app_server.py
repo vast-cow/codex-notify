@@ -26,6 +26,10 @@ def rpc_error(request_id, code, message):
     return json.dumps({"id": request_id, "error": {"code": code, "message": message}})
 
 
+def goal_response(request_id, status):
+    return response(request_id, {"goal": {"threadId": THREAD_ID, "status": status}})
+
+
 class SettingsTests(unittest.TestCase):
     def test_defaults_match_example(self):
         example = Path(__file__).resolve().parents[1] / "config.example.json"
@@ -63,7 +67,7 @@ class SettingsTests(unittest.TestCase):
 
 
 class LookupTests(unittest.TestCase):
-    def lookup(self, replies, *, event=EVENT, **options):
+    def lookup(self, replies, *, event=EVENT, check_goal=False, wait_for_turn=None, **options):
         connection = Mock(send=AsyncMock(), recv=AsyncMock(side_effect=replies))
         closed = Mock()
 
@@ -76,7 +80,9 @@ class LookupTests(unittest.TestCase):
 
         settings = app_server.Settings(enabled=True, **options)
         with patch.object(app_server, "_connect", side_effect=connect):
-            metadata = app_server.lookup_thread(settings, event)
+            metadata = app_server.lookup_thread(
+                settings, event, check_goal=check_goal, wait_for_turn=wait_for_turn,
+            )
         closed.assert_called_once_with(settings.endpoint)
         return metadata, [json.loads(call.args[0]) for call in connection.send.await_args_list]
 
@@ -124,6 +130,99 @@ class LookupTests(unittest.TestCase):
         self.assertEqual(metadata, app_server.ThreadMetadata(None, True))
         self.assertEqual(sent[-1]["method"], "thread/list")
         self.assertIs(sent[-1]["params"]["archived"], True)
+
+    def test_goal_lookup_uses_same_connection_and_exact_thread_id(self):
+        metadata, sent = self.lookup([
+            response(1, INITIALIZE), response(2, {"thread": THREAD}),
+            response(3, {"data": []}), response(4, {"data": [THREAD]}),
+            goal_response(5, "active"),
+        ], check_goal=True)
+        self.assertEqual(metadata, app_server.ThreadMetadata(False, False, active_goal=True))
+        self.assertEqual(sent[-1], {
+            "id": 5, "method": "thread/goal/get", "params": {"threadId": THREAD_ID},
+        })
+
+    def test_no_goal_and_nonactive_goal_statuses(self):
+        replies = [response(2, {"goal": None})] + [goal_response(2, status) for status in (
+            "complete", "paused", "blocked", "budgetLimited", "usageLimited",
+        )]
+        for reply in replies:
+            with self.subTest(reply=reply):
+                wait_for_turn = Mock()
+                metadata, _ = self.lookup(
+                    [response(1, INITIALIZE), reply], skip_ephemeral=False, skip_archived=False,
+                    check_goal=True, wait_for_turn=wait_for_turn,
+                )
+                self.assertIs(metadata.active_goal, False)
+                self.assertEqual(metadata.failures, [])
+                wait_for_turn.assert_not_called()
+
+    def test_goal_failures_are_unknown(self):
+        for result in (None, [], {}, {"goal": []}, {"goal": {}},
+                       {"goal": {"threadId": THREAD_ID, "status": False}},
+                       {"goal": {"threadId": THREAD_ID, "status": "unexpected"}},
+                       {"goal": {"status": "active"}},
+                       {"goal": {"threadId": "unrelated", "status": "active"}}):
+            with self.subTest(result=result):
+                metadata, _ = self.lookup([
+                    response(1, INITIALIZE), response(2, {"thread": THREAD}),
+                    response(3, result),
+                ], skip_archived=False, check_goal=True)
+                self.assertIs(metadata.ephemeral, False)
+                self.assertIsNone(metadata.active_goal)
+                self.assertIn("thread/goal/get", metadata.failures[0])
+
+    def test_unsupported_goal_lookup_is_unknown(self):
+        metadata, _ = self.lookup([
+            response(1, INITIALIZE), rpc_error(2, -32601, "private goal objective"),
+        ], skip_ephemeral=False, skip_archived=False, check_goal=True)
+        self.assertEqual(metadata, app_server.ThreadMetadata(
+            failures=["thread/goal/get is unsupported"],
+        ))
+
+    def test_confirmed_ephemeral_or_archived_skips_goal_lookup(self):
+        for replies, expected in (
+            ([response(2, {"thread": {**THREAD, "ephemeral": True}})], "ephemeral"),
+            ([rpc_error(2, -32601, "unsupported"), response(3, {"data": [THREAD]})], "archived"),
+        ):
+            with self.subTest(expected=expected):
+                metadata, sent = self.lookup([response(1, INITIALIZE), *replies], check_goal=True)
+                self.assertIs(getattr(metadata, expected), True)
+                self.assertIsNone(metadata.active_goal)
+                self.assertNotIn("thread/goal/get", [message["method"] for message in sent])
+
+    def test_each_goal_query_times_out_and_leaves_the_state_unknown(self):
+        for recheck in (False, True):
+            with self.subTest(recheck=recheck):
+                replies = [response(1, INITIALIZE)]
+                if recheck:
+                    replies.append(goal_response(2, "active"))
+                replies = iter(replies)
+
+                async def recv():
+                    reply = next(replies, None)
+                    if reply is None:
+                        await asyncio.Event().wait()
+                    return reply
+
+                wait_for_turn = Mock()
+                metadata, sent = self.lookup(
+                    recv, skip_ephemeral=False, skip_archived=False,
+                    check_goal=True, wait_for_turn=wait_for_turn, timeout_seconds=0.05,
+                )
+                self.assertEqual(metadata, app_server.ThreadMetadata(failures=["lookup timeout"]))
+                self.assertEqual([call["method"] for call in sent].count("thread/goal/get"), 1 + recheck)
+                self.assertEqual(wait_for_turn.call_count, int(recheck))
+
+    def test_recheck_gets_a_fresh_timeout_after_the_wait(self):
+        metadata, sent = self.lookup([
+            response(1, INITIALIZE), goal_response(2, "active"), goal_response(3, "complete"),
+        ], skip_ephemeral=False, skip_archived=False, check_goal=True,
+            wait_for_turn=lambda: Event().wait(timeout=0.1), timeout_seconds=0.05)
+        self.assertIs(metadata.active_goal, False)
+        self.assertEqual(sent[-1], {
+            "id": 3, "method": "thread/goal/get", "params": {"threadId": THREAD_ID},
+        })
 
     def test_unknown_ephemeral_does_not_prevent_confirmed_archived(self):
         missing = {key: value for key, value in THREAD.items() if key != "ephemeral"}

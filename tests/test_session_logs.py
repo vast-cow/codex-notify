@@ -9,11 +9,6 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-try:
-    import sqlite3
-except ImportError:
-    sqlite3 = None
-
 import main
 import session_logs
 from app_server import ThreadMetadata
@@ -53,7 +48,7 @@ class LocalFilterTestCase(unittest.TestCase):
         return path
 
     def run_notification(self, *, options=None, payload=EVENT, on_sleep=None,
-                         codex_home=None, sqlite_home=""):
+                         codex_home=None):
         config = {
             "notification": options or {},
             "telegram": {"enabled": True, "bot_token": "test", "chat_id": "test"},
@@ -71,13 +66,13 @@ class LocalFilterTestCase(unittest.TestCase):
         clock = SimpleNamespace(monotonic=lambda: self.elapsed, sleep=sleep)
         environment = {
             "CODEX_HOME": str(self.codex_home) if codex_home is None else codex_home,
-            "CODEX_SQLITE_HOME": str(sqlite_home),
         }
         with patch.dict(os.environ, environment), \
                 patch.object(session_logs, "time", clock), \
                 patch.object(main, "CONFIG_PATH", self.config_path), \
                 patch.object(sys, "argv", ["main.py", json.dumps(payload)]), \
-                patch.object(main.app_server, "lookup_thread", return_value=ThreadMetadata(False, False)) as lookup, \
+                patch.object(main.app_server, "lookup_thread",
+                             return_value=ThreadMetadata(False, False, active_goal=False)) as lookup, \
                 patch.object(main, "format_message", wraps=main.format_message) as formatter, \
                 patch.object(main, "post_json", return_value=(200, b'{"ok":true}')) as post, \
                 contextlib.redirect_stdout(io.StringIO()) as stdout, \
@@ -224,182 +219,7 @@ class DurationFilterTests(LocalFilterTestCase):
         with patch.dict(os.environ, {"HOME": str(self.directory)}):
             self.assert_delivered(self.run_notification(codex_home=""))
 
-
-@unittest.skipIf(sqlite3 is None, "Python was built without SQLite support")
-class ActiveGoalFilterTests(LocalFilterTestCase):
-    def write_goals(self, *rows, path=None):
-        if path is None:
-            path = self.codex_home / "goals_1.sqlite"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.closing(sqlite3.connect(path)) as connection, connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS thread_goals (thread_id TEXT PRIMARY KEY, status TEXT)"
-            )
-            connection.execute("DELETE FROM thread_goals")
-            connection.executemany("INSERT INTO thread_goals VALUES (?, ?)", rows)
-        return path
-
-    def test_only_active_goal_in_event_thread_suppresses_delivery_by_default(self):
-        self.write_log(completion(60_000))
-        for status in ("active", "complete", "paused", "blocked", "budget_limited", "usage_limited"):
-            with self.subTest(status=status):
-                self.write_goals((THREAD_ID, status), (OTHER_THREAD_ID, "active"))
-                result = self.run_notification()
-                if status == "active":
-                    self.assert_skipped(result, "skipped: active goal")
-                else:
-                    self.assert_delivered(result)
-        self.write_goals((OTHER_THREAD_ID, "active"))
-        self.assert_delivered(self.run_notification())
-
-    def test_disabled_filter_does_not_open_database_or_wait(self):
-        self.write_goals((THREAD_ID, "active"))
-        with patch.object(sqlite3, "connect", side_effect=AssertionError), \
-                patch.object(session_logs, "turn_completion", side_effect=AssertionError):
-            self.assert_delivered(self.run_notification(options={
-                "min_turn_duration_minutes": 0, "skip_active_goals": False,
-            }))
-
-    def test_nonboolean_setting_is_a_configuration_error(self):
-        for value in (None, 0, 1, 0.0, "true", "false", [], {}):
-            with self.subTest(value=value), patch.object(sqlite3, "connect", side_effect=AssertionError):
-                self.assert_skipped(self.run_notification(options={
-                    "min_turn_duration_minutes": 0, "skip_active_goals": value,
-                }), "Configuration error: notification.skip_active_goals", status=1)
-
-    def test_project_and_duration_filters_precede_database_lookup(self):
-        self.write_goals((THREAD_ID, "active"))
-        self.write_log(completion(59_999))
-        with patch.object(sqlite3, "connect", side_effect=AssertionError):
-            self.assert_skipped(self.run_notification(options={
-                "excluded_project_paths": [EVENT["cwd"]],
-            }), "")
-            self.assert_skipped(self.run_notification(), "is below")
-
-    def test_missing_corrupt_or_unrecognized_database_allows_delivery(self):
-        options = {"min_turn_duration_minutes": 0}
-        self.codex_home.mkdir()
-        path = self.codex_home / "goals_1.sqlite"
-        self.assert_delivered(self.run_notification(options=options))
-        self.assertEqual(list(self.codex_home.iterdir()), [])
-
-        # A corrupt current database takes precedence over the legacy file.
-        self.write_goals((THREAD_ID, "active"), path=self.codex_home / "state_5.sqlite")
-        path.write_bytes(b"not a SQLite database")
-        self.assert_delivered(self.run_notification(options=options))
-        path.unlink()
-        with contextlib.closing(sqlite3.connect(path)) as connection:
-            connection.execute("CREATE TABLE other_table (id TEXT)")
-        self.assert_delivered(self.run_notification(options=options))
-        self.assertEqual(self.elapsed, 0)
-
-    def test_legacy_database_used_when_current_database_is_missing(self):
-        self.write_log(completion(60_000))
-        self.write_goals((THREAD_ID, "active"), path=self.codex_home / "state_5.sqlite")
-        self.assert_skipped(self.run_notification(), "skipped: active goal")
-        self.assertFalse((self.codex_home / "goals_1.sqlite").exists())
-
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
-    def test_named_pipes_at_database_paths_allow_delivery_without_opening(self):
-        current = self.codex_home / "goals_1.sqlite"
-        legacy = self.write_goals((THREAD_ID, "active"), path=self.codex_home / "state_5.sqlite")
-        options = {"min_turn_duration_minutes": 0}
-        with patch.object(sqlite3, "connect", side_effect=AssertionError):
-            os.mkfifo(current)
-            self.assert_delivered(self.run_notification(options=options))
-
-            current.unlink()
-            legacy.unlink()
-            os.mkfifo(legacy)
-            self.assert_delivered(self.run_notification(options=options))
-
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
-    def test_named_pipes_at_database_companion_paths_allow_delivery_without_opening(self):
-        database = self.write_goals((THREAD_ID, "active"))
-        options = {"min_turn_duration_minutes": 0}
-        with patch.object(sqlite3, "connect", side_effect=AssertionError):
-            for suffix in ("-journal", "-wal"):
-                with self.subTest(suffix=suffix):
-                    companion = database.with_name(database.name + suffix)
-                    os.mkfifo(companion)
-                    try:
-                        self.assert_delivered(self.run_notification(options=options))
-                    finally:
-                        companion.unlink()
-
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
-    def test_unused_shared_memory_pipe_preserves_active_goal_suppression(self):
-        database = self.write_goals((THREAD_ID, "active"))
-        with contextlib.closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("PRAGMA journal_mode=DELETE").fetchone(), ("delete",))
-        self.write_log(completion(60_000))
-        os.mkfifo(database.with_name(database.name + "-shm"))
-        self.assert_skipped(self.run_notification(), "skipped: active goal")
-
-    def test_unused_shared_memory_stat_error_preserves_active_goal_suppression(self):
-        database = self.write_goals((THREAD_ID, "active")).resolve()
-        with contextlib.closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("PRAGMA journal_mode=DELETE").fetchone(), ("delete",))
-        self.write_log(completion(60_000))
-        shared_memory = database.with_name(database.name + "-shm")
-        stat = Path.stat
-
-        def stat_with_error(path, *args, **kwargs):
-            if path == shared_memory:
-                raise OSError("could not read shared-memory file metadata")
-            return stat(path, *args, **kwargs)
-
-        with patch.object(Path, "stat", stat_with_error):
-            self.assert_skipped(self.run_notification(), "skipped: active goal")
-
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
-    def test_shared_memory_pipe_with_wal_allows_delivery_without_opening(self):
-        for mode in ("wal", "delete"):
-            with self.subTest(mode=mode):
-                self.codex_home = self.directory / mode
-                database = self.write_goals((THREAD_ID, "active"))
-                with contextlib.closing(sqlite3.connect(database)) as connection:
-                    self.assertEqual(connection.execute(f"PRAGMA journal_mode={mode}").fetchone(), (mode,))
-                if mode == "delete":
-                    database.with_name(database.name + "-wal").write_bytes(b"existing WAL file")
-                os.mkfifo(database.with_name(database.name + "-shm"))
-                with patch.object(sqlite3, "connect", side_effect=AssertionError):
-                    self.assert_delivered(self.run_notification(options={"min_turn_duration_minutes": 0}))
-
-    def test_sqlite_home_takes_precedence_over_codex_home_and_default(self):
-        self.codex_home = self.directory / ".codex"
-        self.write_goals((THREAD_ID, "active"))
-        self.write_log(completion(60_000))
-        custom_home = self.directory / "sqlite #1"
-        self.write_goals((THREAD_ID, "paused"), path=custom_home / "goals_1.sqlite")
-        with patch.dict(os.environ, {"HOME": str(self.directory)}):
-            self.assert_skipped(self.run_notification(codex_home=""), "skipped: active goal")
-            self.assert_delivered(self.run_notification(sqlite_home=custom_home))
-
-    def test_zero_minimum_rechecks_goal_after_matching_turn_completion(self):
-        sqlite_home = self.directory / "sqlite"
-        database = self.write_goals((THREAD_ID, "active"), path=sqlite_home / "goals_1.sqlite")
-        log = self.write_log(completion(60_000, turn_id="other-turn"))
-        record = completion(0, event_type="turn_complete")
-        del record["payload"]["duration_ms"]
-        finished = False
-
-        def finish_turn(elapsed):
-            nonlocal finished
-            if elapsed >= 0.3 and not finished:
-                self.write_goals((THREAD_ID, "blocked"), path=database)
-                with log.open("a", encoding="utf-8") as writer:
-                    writer.write(json.dumps(record) + "\n")
-                finished = True
-
-        self.assert_delivered(self.run_notification(
-            options={"min_turn_duration_minutes": 0}, on_sleep=finish_turn, sqlite_home=sqlite_home,
-        ))
-        self.assertTrue(finished)
-        self.assertAlmostEqual(self.elapsed, 0.3)
-
-    def test_zero_minimum_finds_log_archived_during_lookup(self):
-        self.write_goals((THREAD_ID, "active"))
+    def test_finds_log_archived_during_lookup(self):
         log = self.write_log()
         archived_log = self.codex_home / "archived_sessions" / log.name
         archived_log.parent.mkdir()
@@ -412,22 +232,12 @@ class ActiveGoalFilterTests(LocalFilterTestCase):
             return paths
 
         def finish_turn(_):
-            self.write_goals((THREAD_ID, "blocked"))
             with archived_log.open("a", encoding="utf-8") as writer:
                 writer.write(json.dumps(completion(60_000)) + "\n")
 
         with patch.object(session_logs, "_session_paths", side_effect=archive_after_discovery):
-            self.assert_delivered(self.run_notification(
-                options={"min_turn_duration_minutes": 0}, on_sleep=finish_turn,
-            ))
+            self.assert_delivered(self.run_notification(on_sleep=finish_turn))
         self.assertAlmostEqual(self.elapsed, session_logs.POLL_INTERVAL_SECONDS)
-
-    def test_zero_minimum_still_suppresses_active_goal_after_wait_limit(self):
-        self.write_goals((THREAD_ID, "active"))
-        self.write_log(completion(60_000, turn_id="other-turn"))
-        self.assert_skipped(self.run_notification(options={"min_turn_duration_minutes": 0}),
-                            "skipped: active goal")
-        self.assertAlmostEqual(self.elapsed, session_logs.COMPLETION_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

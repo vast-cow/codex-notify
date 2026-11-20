@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-Enable this feature to suppress Telegram and Slack notifications for ephemeral or archived Codex threads. The notifier connects to an app-server you already run, using the endpoint in `config.json`.
+Enable this feature to suppress Telegram and Slack notifications for ephemeral threads, archived threads, or threads with active goals. The notifier connects to an app-server you already run, using the endpoint in `config.json`.
 
 ## Setup
 
@@ -50,21 +50,24 @@ Set `app_server.endpoint` to the expanded absolute path, for example `unix:///ho
 
 ## Filtering decisions
 
-The notifier checks project exclusions, minimum turn duration, and active goals before looking up app-server metadata. It performs one lookup per eligible completion event when integration and at least one app-server filter are enabled. It shares the result across both channels.
+The notifier checks project exclusions and minimum turn duration before connecting. When `app_server.enabled` and at least one filter are enabled, the notifier uses one app-server connection per eligible completion event and shares the result across both channels. Goal checks require `notification.skip_active_goals`, which defaults to `true`.
 
-- A confirmed ephemeral or archived state suppresses both channels if its corresponding filter is enabled. A confirmed exclusion takes precedence over unknown metadata and exits with status `0`.
+- A confirmed ephemeral or archived state suppresses both channels if its corresponding filter is enabled. The notifier checks these states first and exits with status `0` for a confirmed exclusion, even if another state is unknown.
+- A confirmed active goal also suppresses both channels with status `0`. With a zero minimum duration, an initially active goal triggers a wait for the turn's completion record and a second goal request. The second response determines the goal state, even if the wait expired. See [active goal filtering](configuration.md#active-goal-filtering).
 - When all enabled states are confirmed false, delivery proceeds. Disabled filters do not affect the decision.
 - If an enabled state is unknown, `notify` proceeds with delivery, `skip` suppresses both channels with status `0`, and `error` suppresses both channels with status `1`.
 
-The timeout covers connection setup, initialization, and all metadata requests. Diagnostics report confirmed exclusions, lookup errors, unavailable states, and the resulting delivery decision. Run `main.py` directly with a completion event to see its output if your Codex client discards hook stdout and stderr.
+Connection setup, initialization, and thread metadata requests share an `app_server.timeout_seconds` deadline. Each goal request gets its own deadline of the same length. Diagnostics report confirmed exclusions, lookup errors, unavailable states, and the resulting delivery decision. Run `main.py` directly with a completion event to see its output if your Codex client discards hook stdout and stderr.
 
 ## Thread identity and compatibility
 
 The client requests `thread/read` with `includeTurns: false` for the ephemeral flag. Archive state requires an exact thread ID match in an archived or active `thread/list` result. Empty results and unrelated list rows leave the state unknown. The client checks the working directory when present on both sides and treats inconsistencies as lookup failures.
 
+The client sends the event's thread ID as `threadId` to `thread/goal/get`. An explicit `result.goal` of `null` means the thread has no goal. A goal object must contain the matching `threadId` and a valid status. Unsupported methods and invalid replies leave the goal state unknown. [Codex goal response schema](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/app-server-protocol/schema/typescript/v2/ThreadGoalGetResponse.ts)
+
 These checks verify thread identity. The completion event has no process identifier to correlate with the listener. The initialization response describes the server environment, and even the experimental `server/diagnostics` process ID is local to the server and has no matching field in the event. A server sharing durable history may be able to read the same saved thread. Ephemeral threads live in the app-server instance that owns them and may be unavailable from a separate listener. Use the listener that handles your turns. Unavailable threads follow the configured failure policy. [Codex app-server protocol](https://developers.openai.com/codex/app-server)
 
-Use a Codex version that supports your chosen listener and both metadata methods. Some older versions, including Codex CLI 0.169.0, ignore `includedThreadIds`. Archive membership can still be established by an exact match on the first returned page of the corresponding list. A miss follows the failure policy, as do unavailable methods or metadata, unindexed threads, and threads hidden from ordinary listings. [Thread list ID filters](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#thread-list-id-filters)
+Use a Codex version that supports your chosen listener and the methods for your enabled filters. Some older versions, including Codex CLI 0.169.0, ignore `includedThreadIds`. Archive membership can still be established by an exact match on the first returned page of the corresponding list. A miss follows the failure policy, as do unavailable methods or metadata, unindexed threads, and threads hidden from ordinary listings. [Thread list ID filters](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#thread-list-id-filters)
 
 ## Security
 
