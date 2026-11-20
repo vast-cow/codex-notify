@@ -1,7 +1,6 @@
 """Read the goal status for a notification event's thread."""
 
 import os
-import sqlite3
 from contextlib import closing
 from pathlib import Path
 
@@ -9,6 +8,11 @@ import session_logs
 
 
 def _goal_status(thread_id):
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+
     try:
         sqlite_home = Path(
             os.environ.get("CODEX_SQLITE_HOME") or os.environ.get("CODEX_HOME") or "~/.codex"

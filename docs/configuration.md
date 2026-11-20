@@ -132,7 +132,7 @@ The notifier reads the matching thread and turn's `duration_ms` from Codex's JSO
 
 `notification.skip_active_goals` defaults to `true`, including in existing configurations that omit it. Set it to `false` to disable the goal lookup and its completion wait. The setting accepts only JSON booleans.
 
-After project exclusions and the minimum duration check, the notifier reads `thread_goals.status` for the event's thread. It skips both Telegram and Slack and exits with status `0` when the goal is `active`. Completed, paused, stalled, budget-limited, and usage-limited goals leave delivery to the usual filters, as do missing goals and unreadable databases.
+After project exclusions and the minimum duration check, the notifier reads `thread_goals.status` for the event's thread. It skips both Telegram and Slack and exits with status `0` when the goal is `active`. The usual filters apply to completed, paused, stalled, budget-limited, and usage-limited goals. They also apply when the goal is missing, the database is unreadable, or Python lacks SQLite support.
 
 The database directory comes from `CODEX_SQLITE_HOME`, then `CODEX_HOME`, with `~/.codex` as the default. The notifier opens `goals_1.sqlite` read-only and falls back to `state_5.sqlite` in the same directory if `goals_1.sqlite` is absent.
 

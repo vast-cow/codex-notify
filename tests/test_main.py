@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -95,19 +96,19 @@ class FormattingTests(unittest.TestCase):
 
 
 class NotificationFlowTests(unittest.TestCase):
-    def run_notification(self, payload, options=None):
+    def run_notification(self, payload, options=None, *, notifier=main):
         config = {
             "telegram": {"enabled": True}, "slack": {"enabled": True},
             "notification": {
                 "min_turn_duration_minutes": 0, "skip_active_goals": False, **(options or {}),
             },
         }
-        with patch.object(main, "load_config", return_value=config), \
-                patch.object(main.sys, "argv", ["main.py", json.dumps(payload)]), \
-                patch.object(main, "send_telegram") as telegram, \
-                patch.object(main, "send_slack") as slack, \
+        with patch.object(notifier, "load_config", return_value=config), \
+                patch.object(sys, "argv", ["main.py", json.dumps(payload)]), \
+                patch.object(notifier, "send_telegram") as telegram, \
+                patch.object(notifier, "send_slack") as slack, \
                 contextlib.redirect_stdout(io.StringIO()):
-            status = main.main()
+            status = notifier.main()
         self.assertEqual(status, 0)
         return telegram, slack
 
@@ -115,6 +116,19 @@ class NotificationFlowTests(unittest.TestCase):
         telegram, slack = self.run_notification(event())
         telegram.assert_called_once_with({"enabled": True}, main.format_message(event(), {}), 10)
         slack.assert_called_once_with({"enabled": True}, main.format_message(event(), {}), 10)
+
+    def test_completion_delivers_without_sqlite(self):
+        with patch.dict(sys.modules, {"sqlite3": None}):
+            del sys.modules["main"]
+            del sys.modules["thread_goals"]
+            notifier = importlib.import_module("main")
+            for enabled in (True, False):
+                with self.subTest(skip_active_goals=enabled):
+                    telegram, slack = self.run_notification(
+                        event(), {"skip_active_goals": enabled}, notifier=notifier,
+                    )
+                    telegram.assert_called_once()
+                    slack.assert_called_once()
 
     def test_completion_without_thread_id_still_delivers(self):
         payload = event()

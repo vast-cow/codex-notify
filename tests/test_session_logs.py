@@ -2,13 +2,17 @@ import contextlib
 import io
 import json
 import os
-import sqlite3
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+
+try:
+    import sqlite3
+except ImportError:
+    sqlite3 = None
 
 import main
 import session_logs
@@ -221,6 +225,7 @@ class DurationFilterTests(LocalFilterTestCase):
             self.assert_delivered(self.run_notification(codex_home=""))
 
 
+@unittest.skipIf(sqlite3 is None, "Python was built without SQLite support")
 class ActiveGoalFilterTests(LocalFilterTestCase):
     def write_goals(self, *rows, path=None):
         if path is None:
