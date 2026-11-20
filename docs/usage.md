@@ -14,7 +14,7 @@ The tests mock app-server and notification delivery, and run with the Python sta
 
 ## Testing
 
-You can test delivery without running Codex CLI. Set `app_server.enabled` to `false` for this example, or leave `app_server.on_lookup_failure` at its default `notify` to exercise the failure path with a synthetic thread ID.
+You can test delivery without running Codex CLI. In `config.json`, set `min_turn_duration_minutes` to `0` inside the existing `notification` section because the sample event has no matching session log. Restore your preferred value after the test. Set `app_server.enabled` to `false` for this example, or leave `app_server.on_lookup_failure` at its default `notify` to exercise the failure path with a synthetic thread ID.
 
 Execute the following command, replacing `/absolute/path/to/codex-notify` with the actual absolute path to your local checkout. Keep your configured `config.json` alongside `main.py` in that checkout:
 

@@ -33,7 +33,9 @@ Codex CLI runs `main.py` directly from the checkout. Keep `config.json` alongsid
 
 Notifications indicate a completed agent turn; they do not guarantee task success. See [testing and event behavior](docs/usage.md) for a manual test.
 
-You can optionally suppress notifications for ephemeral or archived threads by connecting the notifier to an existing Codex app-server. Filtering is disabled by default.
+By default, Telegram and Slack notify for turns that took at least one minute and have a recorded duration. See [turn duration filtering](docs/configuration.md#minimum-turn-duration) to change the threshold or disable the filter.
+
+You can optionally suppress notifications for ephemeral or archived threads by connecting the notifier to an existing Codex app-server. App-server filtering is disabled by default.
 
 ## Documentation
 

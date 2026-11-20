@@ -27,11 +27,12 @@ The notifier processes the event as follows:
 2. Verify that the event type is `agent-turn-complete`.
 3. Load notification settings from `config.json`.
 4. Validate `notification.excluded_project_paths` and exit successfully if the normalized event `cwd` exactly matches an entry (see [matching rules](configuration.md#exclude-selected-projects)).
-5. If [app-server filtering](app-server.md) is enabled, perform one metadata lookup and apply the configured filter to both channels.
-6. Format the completion message, limiting each Request and Result body independently when truncation is enabled, and adding an optional thread URL.
-7. Send the message to Telegram if enabled.
-8. Send the message to Slack if enabled.
-9. Report notification errors to standard error.
+5. If [turn duration filtering](configuration.md#minimum-turn-duration) is enabled, read the duration from the matching session and turn record. Exit successfully if the duration is below the threshold or unavailable.
+6. If [app-server filtering](app-server.md) is enabled, perform one metadata lookup and apply the configured filter to both channels.
+7. Format the completion message, limiting each Request and Result body independently when truncation is enabled, and adding an optional thread URL.
+8. Send the message to Telegram if enabled.
+9. Send the message to Slack if enabled.
+10. Report notification errors to standard error.
 
 Telegram and Slack are handled independently. A failure in one channel does not prevent the other from being attempted.
 

@@ -98,7 +98,7 @@ class NotificationFlowTests(unittest.TestCase):
     def run_notification(self, payload, options=None):
         config = {
             "telegram": {"enabled": True}, "slack": {"enabled": True},
-            "notification": options or {},
+            "notification": {"min_turn_duration_minutes": 0, **(options or {})},
         }
         with patch.object(main, "load_config", return_value=config), \
                 patch.object(main.sys, "argv", ["main.py", json.dumps(payload)]), \
@@ -239,7 +239,10 @@ class AppServerFlowTests(unittest.TestCase):
             "app_server": {"enabled": True, **app_options},
             "telegram": {"enabled": True},
             "slack": {"enabled": True},
-            "notification": {"excluded_project_paths": [payload["cwd"]]} if exclude else {},
+            "notification": {
+                "min_turn_duration_minutes": 0,
+                "excluded_project_paths": [payload["cwd"]] if exclude else [],
+            },
         }
         with patch.object(main, "load_config", return_value=config), \
                 patch.object(sys, "argv", ["main.py", json.dumps(payload)]), \

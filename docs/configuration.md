@@ -19,6 +19,7 @@ Copy `config.example.json` to `config.json` in the repository root and edit it w
     "title": "Codex CLI",
     "include_project": true,
     "excluded_project_paths": [],
+    "min_turn_duration_minutes": 1,
     "include_input": true,
     "include_output": true,
     "truncate_enabled": true,
@@ -51,6 +52,7 @@ Defaults below apply when a setting is omitted. The example configuration explic
 | `notification.title` | Notification title | `Codex CLI` |
 | `notification.include_project` | Include project name and working directory | `true` |
 | `notification.excluded_project_paths` | Project directory paths for which both channels are skipped | `[]` |
+| `notification.min_turn_duration_minutes` | Minimum recorded turn duration in minutes for both channels. Set to `0` to disable. | `1` |
 | `notification.include_input` | Include the user request | `true` |
 | `notification.include_output` | Include the final assistant response | `true` |
 | `notification.truncate_enabled` | Truncate the Request and Result bodies | `true` |
@@ -117,6 +119,12 @@ or either Telegram or Slack delivery. An omitted setting or empty array keeps
 normal delivery. Events with a missing or empty `cwd` are not excluded. Invalid
 settings (including a non-array value, non-string entries, and empty or
 whitespace-only strings) are reported as configuration errors.
+
+## Minimum Turn Duration
+
+Telegram and Slack notify for completed turns with a recorded duration of at least one minute by default. Change `min_turn_duration_minutes` in the `notification` section of `config.json`. For example, `0.5` includes turns of 30 seconds or longer. Set it to `0` to disable the filter and skip reading session logs. The setting accepts finite, non-negative numbers, including decimals. Other values cause a configuration error.
+
+The notifier reads the matching thread and turn's `duration_ms` from Codex's JSONL session logs under `CODEX_HOME`, which defaults to `~/.codex`. It waits up to one second for the session log to appear, then up to 30 seconds for the completion record. If the duration is below the threshold or cannot be determined, the notifier prints a reason and exits with status `0` before looking up app-server metadata or sending either notification.
 
 ## Request and Result Length
 

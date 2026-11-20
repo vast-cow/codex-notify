@@ -2,14 +2,17 @@
 """Codex CLI completion notifier for Telegram and Slack."""
 
 import json
+import math
 import os
 import sys
 import urllib.error
 import urllib.request
+from fractions import Fraction
 from pathlib import Path
 from uuid import UUID
 
 import app_server
+import session_logs
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -38,6 +41,30 @@ def is_project_excluded(event, config):
 
     project_path = normalize(cwd)
     return any(project_path == normalize(path) for path in paths)
+
+
+def is_turn_duration_filtered(event, config):
+    minutes = config.get("notification", {}).get("min_turn_duration_minutes", 1)
+    if (
+        type(minutes) not in (int, float)
+        or (type(minutes) is float and not math.isfinite(minutes))
+        or minutes < 0
+    ):
+        raise ValueError("notification.min_turn_duration_minutes must be a finite non-negative number")
+    if minutes == 0:
+        return False
+
+    try:
+        duration_ms = session_logs.turn_duration_ms(event)
+    except session_logs.DurationUnavailable as error:
+        print(f"[notify] skipped: turn duration is unknown ({error})")
+        return True
+
+    # Compare in milliseconds without rounding decimal thresholds to a float.
+    if duration_ms < Fraction(str(minutes)) * 60_000:
+        print(f"[notify] skipped: turn duration {duration_ms} ms is below the {minutes}-minute minimum")
+        return True
+    return False
 
 
 def app_server_exit_status(event, config):
@@ -239,6 +266,8 @@ def main():
     try:
         config = load_config()
         if is_project_excluded(event, config):
+            return 0
+        if is_turn_duration_filtered(event, config):
             return 0
         status = app_server_exit_status(event, config)
         if status is not None:
