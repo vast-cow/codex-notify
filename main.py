@@ -14,6 +14,7 @@ from uuid import UUID
 
 import app_server
 import session_logs
+import thread_goals
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -282,9 +283,18 @@ def main():
 
     try:
         config = load_config()
+        options = config.get("notification", {})
+        skip_active_goals = options.get("skip_active_goals", True)
+        if not isinstance(skip_active_goals, bool):
+            raise ValueError("notification.skip_active_goals must be a boolean")
         if is_project_excluded(event, config):
             return 0
         if is_turn_duration_filtered(event, config):
+            return 0
+        if skip_active_goals and thread_goals.is_active(
+            event, wait_for_completion=options.get(MIN_TURN_DURATION_KEY) == 0,
+        ):
+            print("[notify] skipped: active goal")
             return 0
         status = app_server_exit_status(event, config)
         if status is not None:

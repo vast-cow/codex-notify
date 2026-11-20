@@ -50,7 +50,7 @@ Set `app_server.endpoint` to the expanded absolute path, for example `unix:///ho
 
 ## Filtering decisions
 
-Project exclusions take precedence. The notifier performs one lookup per completion event when integration and at least one filter are enabled. It shares the result across both channels.
+The notifier checks project exclusions, minimum turn duration, and active goals before looking up app-server metadata. It performs one lookup per eligible completion event when integration and at least one app-server filter are enabled. It shares the result across both channels.
 
 - A confirmed ephemeral or archived state suppresses both channels if its corresponding filter is enabled. A confirmed exclusion takes precedence over unknown metadata and exits with status `0`.
 - When all enabled states are confirmed false, delivery proceeds. Disabled filters do not affect the decision.

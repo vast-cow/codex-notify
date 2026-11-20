@@ -20,6 +20,7 @@ Copy `config.example.json` to `config.json` in the repository root and edit it w
     "include_project": true,
     "excluded_project_paths": [],
     "min_turn_duration_minutes": 1,
+    "skip_active_goals": true,
     "include_input": true,
     "include_output": true,
     "truncate_enabled": true,
@@ -53,6 +54,7 @@ Defaults below apply when a setting is omitted. The example configuration explic
 | `notification.include_project` | Include project name and working directory | `true` |
 | `notification.excluded_project_paths` | Project directory paths for which both channels are skipped | `[]` |
 | `notification.min_turn_duration_minutes` | Minimum recorded turn duration in minutes for both channels. Set to `0` to disable. | `1` |
+| `notification.skip_active_goals` | Skip both channels while the event's thread has an active goal. Set to `false` to disable. | `true` |
 | `notification.include_input` | Include the user request | `true` |
 | `notification.include_output` | Include the final assistant response | `true` |
 | `notification.truncate_enabled` | Truncate the Request and Result bodies | `true` |
@@ -122,9 +124,19 @@ whitespace-only strings) are reported as configuration errors.
 
 ## Minimum Turn Duration
 
-Telegram and Slack notify for completed turns with a recorded duration of at least one minute by default. Change `min_turn_duration_minutes` in the `notification` section of `config.json`. For example, `0.5` includes turns of 30 seconds or longer. Set it to `0` to disable the filter and skip reading session logs. The setting accepts finite, non-negative numbers, including decimals. Other values cause a configuration error.
+By default, the minimum recorded turn duration for Telegram and Slack is one minute. Change `min_turn_duration_minutes` in the `notification` section of `config.json`. For example, `0.5` includes turns of 30 seconds or longer. Set it to `0` to disable the duration filter. The setting accepts finite, non-negative numbers, including decimals. Other values cause a configuration error.
 
-The notifier reads the matching thread and turn's `duration_ms` from Codex's JSONL session logs under `CODEX_HOME`, which defaults to `~/.codex`. It waits up to one second for the session log to appear, then up to 30 seconds for the completion record. If the duration is below the threshold or cannot be determined, the notifier prints a reason and exits with status `0` before looking up app-server metadata or sending either notification.
+The notifier reads the matching thread and turn's `duration_ms` from Codex's JSONL session logs under `CODEX_HOME`, which defaults to `~/.codex`. It waits up to one second for the session log to appear, then up to 30 seconds for the completion record. If the duration is below the threshold or cannot be determined, the notifier prints a reason and exits with status `0` before checking goal status or app-server metadata.
+
+## Active Goal Filtering
+
+`notification.skip_active_goals` defaults to `true`, including in existing configurations that omit it. Set it to `false` to disable the goal lookup and its completion wait. The setting accepts only JSON booleans.
+
+After project exclusions and the minimum duration check, the notifier reads `thread_goals.status` for the event's thread. It skips both Telegram and Slack and exits with status `0` when the goal is `active`. Completed, paused, stalled, budget-limited, and usage-limited goals leave delivery to the usual filters, as do missing goals and unreadable databases.
+
+The database directory comes from `CODEX_SQLITE_HOME`, then `CODEX_HOME`, with `~/.codex` as the default. The notifier opens `goals_1.sqlite` read-only and falls back to `state_5.sqlite` in the same directory if `goals_1.sqlite` is absent.
+
+When `min_turn_duration_minutes` is `0` and the first lookup finds an active goal, the notifier still waits for the matching turn's completion record. Codex can finalize the goal status after invoking the notification hook. The notifier uses the same one-second session log and 30-second completion limits, then reads the goal status again even if the wait expires. [Codex turn hook](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/session/turn.rs#L824) [Codex goal handling at turn stop](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/ext/goal/src/extension.rs#L314)
 
 ## Request and Result Length
 

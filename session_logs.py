@@ -1,4 +1,4 @@
-"""Read turn completion timings from local Codex session logs."""
+"""Read turn completion records from local Codex session logs."""
 
 import json
 import os
@@ -14,7 +14,7 @@ THREAD_ID_OFFSET = len("rollout-YYYY-MM-DDTHH-MM-SS-")
 
 
 class DurationUnavailable(Exception):
-    """The matching turn has no readable duration."""
+    """The matching turn completion record or its duration is unavailable."""
 
 
 def _raise_walk_error(error):
@@ -75,7 +75,8 @@ def _read_completion(log, thread_id, turn_id, deadline):
     return None
 
 
-def turn_duration_ms(event):
+def turn_completion(event):
+    """Wait for the matching turn's completion record and return its payload."""
     thread_id, turn_id = event.get("thread-id"), event.get("turn-id")
     if not all(isinstance(value, str) and value.strip() for value in (thread_id, turn_id)):
         raise DurationUnavailable("missing thread or turn ID")
@@ -100,10 +101,7 @@ def turn_duration_ms(event):
                         continue
                     completion = _read_completion(log, thread_id, turn_id, deadline)
                     if completion is not None:
-                        duration_ms = completion.get("duration_ms")
-                        if type(duration_ms) is not int or duration_ms < 0:
-                            raise DurationUnavailable("completed record has no valid duration_ms")
-                        return duration_ms
+                        return completion
                 if all(log.closed for log in logs):
                     raise DurationUnavailable("session log belongs to a different thread")
                 _wait(deadline)
@@ -111,3 +109,10 @@ def turn_duration_ms(event):
         raise DurationUnavailable("could not read the session log") from error
 
     raise DurationUnavailable(f"completed record not found within {COMPLETION_TIMEOUT_SECONDS:g} seconds")
+
+
+def turn_duration_ms(event):
+    duration_ms = turn_completion(event).get("duration_ms")
+    if type(duration_ms) is not int or duration_ms < 0:
+        raise DurationUnavailable("completed record has no valid duration_ms")
+    return duration_ms
