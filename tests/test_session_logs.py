@@ -318,7 +318,7 @@ class ActiveGoalFilterTests(LocalFilterTestCase):
         database = self.write_goals((THREAD_ID, "active"))
         options = {"min_turn_duration_minutes": 0}
         with patch.object(sqlite3, "connect", side_effect=AssertionError):
-            for suffix in ("-journal", "-wal", "-shm"):
+            for suffix in ("-journal", "-wal"):
                 with self.subTest(suffix=suffix):
                     companion = database.with_name(database.name + suffix)
                     os.mkfifo(companion)
@@ -326,6 +326,29 @@ class ActiveGoalFilterTests(LocalFilterTestCase):
                         self.assert_delivered(self.run_notification(options=options))
                     finally:
                         companion.unlink()
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
+    def test_unused_shared_memory_pipe_preserves_active_goal_suppression(self):
+        database = self.write_goals((THREAD_ID, "active"))
+        with contextlib.closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode=DELETE").fetchone(), ("delete",))
+        self.write_log(completion(60_000))
+        os.mkfifo(database.with_name(database.name + "-shm"))
+        self.assert_skipped(self.run_notification(), "skipped: active goal")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are unavailable")
+    def test_shared_memory_pipe_with_wal_allows_delivery_without_opening(self):
+        for mode in ("wal", "delete"):
+            with self.subTest(mode=mode):
+                self.codex_home = self.directory / mode
+                database = self.write_goals((THREAD_ID, "active"))
+                with contextlib.closing(sqlite3.connect(database)) as connection:
+                    self.assertEqual(connection.execute(f"PRAGMA journal_mode={mode}").fetchone(), (mode,))
+                if mode == "delete":
+                    database.with_name(database.name + "-wal").write_bytes(b"existing WAL file")
+                os.mkfifo(database.with_name(database.name + "-shm"))
+                with patch.object(sqlite3, "connect", side_effect=AssertionError):
+                    self.assert_delivered(self.run_notification(options={"min_turn_duration_minutes": 0}))
 
     def test_sqlite_home_takes_precedence_over_codex_home_and_default(self):
         self.codex_home = self.directory / ".codex"

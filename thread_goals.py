@@ -8,6 +8,15 @@ from stat import S_ISREG
 import session_logs
 
 
+def _uses_only_rollback_journal(path):
+    if path.with_name(path.name + "-wal").exists():
+        return False
+    with path.open("rb") as database:
+        header = database.read(20)
+    # SQLite stores the write and read format versions at offsets 18 and 19.
+    return header.startswith(b"SQLite format 3\0") and header[18:20] == b"\x01\x01"
+
+
 def _goal_status(thread_id):
     try:
         import sqlite3
@@ -31,7 +40,9 @@ def _goal_status(thread_id):
                 mode = path.with_name(path.name + suffix).stat().st_mode
             except FileNotFoundError:
                 continue
-            if not S_ISREG(mode):
+            if S_ISREG(mode):
+                continue
+            if suffix != "-shm" or not _uses_only_rollback_journal(path):
                 return None
 
         uri = f"{path.as_uri()}?mode=ro"
