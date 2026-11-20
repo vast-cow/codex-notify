@@ -326,6 +326,30 @@ class ActiveGoalFilterTests(LocalFilterTestCase):
         self.assertTrue(finished)
         self.assertAlmostEqual(self.elapsed, 0.3)
 
+    def test_zero_minimum_finds_log_archived_during_lookup(self):
+        self.write_goals((THREAD_ID, "active"))
+        log = self.write_log()
+        archived_log = self.codex_home / "archived_sessions" / log.name
+        archived_log.parent.mkdir()
+        find_paths = session_logs._session_paths
+
+        def archive_after_discovery(*args):
+            paths = find_paths(*args)
+            if log in paths:
+                log.rename(archived_log)
+            return paths
+
+        def finish_turn(_):
+            self.write_goals((THREAD_ID, "blocked"))
+            with archived_log.open("a", encoding="utf-8") as writer:
+                writer.write(json.dumps(completion(60_000)) + "\n")
+
+        with patch.object(session_logs, "_session_paths", side_effect=archive_after_discovery):
+            self.assert_delivered(self.run_notification(
+                options={"min_turn_duration_minutes": 0}, on_sleep=finish_turn,
+            ))
+        self.assertAlmostEqual(self.elapsed, session_logs.POLL_INTERVAL_SECONDS)
+
     def test_zero_minimum_still_suppresses_active_goal_after_wait_limit(self):
         self.write_goals((THREAD_ID, "active"))
         self.write_log(completion(60_000, turn_id="other-turn"))

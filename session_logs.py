@@ -83,18 +83,23 @@ def turn_completion(event):
 
     try:
         codex_home = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
-        deadline = time.monotonic() + LOG_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            paths = _session_paths(codex_home, thread_id, deadline)
-            if paths:
-                break
-            _wait(deadline)
-        else:
-            raise DurationUnavailable(f"session log not found within {LOG_TIMEOUT_SECONDS:g} second")
-
-        deadline = time.monotonic() + COMPLETION_TIMEOUT_SECONDS
         with ExitStack() as stack:
-            logs = [stack.enter_context(path.open("rb")) for path in paths]
+            deadline = time.monotonic() + LOG_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                paths = _session_paths(codex_home, thread_id, deadline)
+                if paths:
+                    try:
+                        logs = [stack.enter_context(path.open("rb")) for path in paths]
+                    except FileNotFoundError:
+                        # Archiving can move a log between discovery and opening.
+                        stack.close()
+                    else:
+                        break
+                _wait(deadline)
+            else:
+                raise DurationUnavailable(f"session log not found within {LOG_TIMEOUT_SECONDS:g} second")
+
+            deadline = time.monotonic() + COMPLETION_TIMEOUT_SECONDS
             while time.monotonic() < deadline:
                 for log in logs:
                     if log.closed:
