@@ -258,11 +258,18 @@ class Notifier:
         self.skip_active_goals = options.get("skip_active_goals", True)
         if not isinstance(self.skip_active_goals, bool):
             raise ValueError("notification.skip_active_goals must be a boolean")
-        self.timeout = float(options.get("timeout_seconds", 10))
+        timeout_error = "notification.timeout_seconds must be a finite positive number"
+        try:
+            self.timeout = float(options.get("timeout_seconds", 10))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(timeout_error) from None
         if not math.isfinite(self.timeout) or self.timeout <= 0:
-            raise ValueError("notification.timeout_seconds must be finite and positive")
+            raise ValueError(timeout_error)
         if options.get("truncate_enabled", True):
-            int(options.get("max_output_length", 140))
+            try:
+                int(options.get("max_output_length", 140))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("notification.max_output_length must be convertible to an integer") from None
         self.deliveries = set()
 
     def is_project_excluded(self, cwd):

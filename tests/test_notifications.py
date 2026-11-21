@@ -136,6 +136,13 @@ class FilterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "skip_active_goals"):
             notifications.Notifier({"notification": {"skip_active_goals": "true"}})
 
+    def test_invalid_numeric_configuration_names_the_setting_without_echoing_the_value(self):
+        for setting in ("timeout_seconds", "max_output_length"):
+            with self.subTest(setting=setting):
+                with self.assertRaisesRegex(ValueError, rf"notification\.{setting} must be") as raised:
+                    notifications.Notifier({"notification": {setting: "private config value"}})
+                self.assertNotIn("private config value", str(raised.exception))
+
     def test_extracts_text_from_summary(self):
         def user(*parts):
             return {"type": "userMessage", "content": list(parts)}
