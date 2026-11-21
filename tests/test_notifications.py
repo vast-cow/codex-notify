@@ -161,7 +161,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             "slack": {"enabled": True, "webhook_url": "https://example.test/slack"},
         })
         for failed in ("Telegram", "Slack"):
-            def post(url, payload, timeout):
+            def post(url, payload, timeout, failed=failed):
                 destination = "Telegram" if "api.telegram.org" in url else "Slack"
                 if destination == failed:
                     raise RuntimeError("private destination information")

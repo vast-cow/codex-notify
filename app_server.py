@@ -9,7 +9,7 @@ import os
 import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 
@@ -134,10 +134,12 @@ class WebSocketClient:
         self.websocket_error = WebSocketException
         endpoint = settings.endpoint
         self.uri = endpoint
-        self.options = {
+        self.options: Dict[str, Any] = {
             "open_timeout": settings.timeout_seconds,
             "close_timeout": 1,
             "compression": None,
+            # Match the Codex remote client's limit for history responses.
+            "max_size": 128 * 1024 * 1024,
             "logger": logging.Logger("codex-notify.app-server", logging.CRITICAL + 1),
         }
         if "proxy" in inspect.signature(connect).parameters:
@@ -153,7 +155,6 @@ class WebSocketClient:
         try:
             async with self.connect(self.uri, **self.options) as connection:
                 rpc = RpcClient(connection, self.connection_closed, on_status, timeout)
-                rpc.reader = asyncio.create_task(rpc.receive())
                 try:
                     await rpc.initialize()
                     yield rpc
@@ -178,8 +179,8 @@ class RpcClient:
         self.timeout = timeout
         self.next_id = 1
         self.pending = {}
-        self.reader = None
         self.failure = None
+        self.reader = asyncio.create_task(self.receive())
 
     async def initialize(self):
         result = await self.request("initialize", {
@@ -201,7 +202,7 @@ class RpcClient:
         return await asyncio.wait_for(self.exchange(method, params), deadline)
 
     async def exchange(self, method, params):
-        if self.failure:
+        if self.failure is not None:
             raise self.failure
         request_id = self.next_id
         self.next_id += 1
@@ -213,6 +214,7 @@ class RpcClient:
         finally:
             self.pending.pop(request_id)
         if message is None:
+            assert self.failure is not None
             raise self.failure
         if "error" in message:
             error = message["error"]
@@ -254,10 +256,10 @@ class RpcClient:
             for response in self.pending.values():
                 if not response.done():
                     response.set_result(None)
+        return self.failure
 
     async def wait_closed(self):
-        await self.reader
-        raise self.failure
+        raise await self.reader
 
 
 async def pages(rpc, method, params, *, deadline=None):

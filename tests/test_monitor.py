@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from websockets.asyncio.server import serve, unix_serve
+from websockets.exceptions import ConnectionClosedOK
 
 from app_server import AppServerError, Settings, WebSocketClient
 from monitor import Monitor
@@ -51,7 +52,10 @@ class Fixture:
                 result = {"result": self.answer(method, request["params"])}
             except AppServerError as exc:
                 result = {"error": {"code": -32600, "message": str(exc)}}
-            await connection.send(json.dumps({"id": request["id"], **result}))
+            try:
+                await connection.send(json.dumps({"id": request["id"], **result}))
+            except ConnectionClosedOK:
+                return
 
     def answer(self, method, params):
         if method == "initialize":
@@ -87,6 +91,8 @@ class Fixture:
 
     @staticmethod
     def page(pages, index):
+        if isinstance(pages[index], AppServerError):
+            raise pages[index]
         return {"data": pages[index], "nextCursor": str(index + 1) if index + 1 < len(pages) else None}
 
     @staticmethod
@@ -158,7 +164,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.fixture.loaded_pages = [["thread"]]
         self.fixture.histories["thread"] = [[previous]]
         async with self.running_monitor() as client:
-            await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] == 1)
+            await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 1)
             await self.fixture.status(client, "thread", "active")
             await self.fixture.status(client, "thread", "idle")
             await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 3)
@@ -172,6 +178,16 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("📝 Request:\nrequest new", message)
             self.assertIn("📋 Result:\nresponse new", message)
             await self.wait_for(lambda: ("thread", "failed") in self.monitor.processed)
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_startup_recovers_delayed_history_without_a_status_event(self):
+        previous = completion("old", completed_at=self.startup - 1)
+        self.fixture.loaded_pages = [["thread"]]
+        self.fixture.histories["thread"] = [[previous]]
+        async with self.running_monitor():
+            await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 1)
+            self.fixture.histories["thread"] = [[self.recent("startup"), previous]]
+            self.assertIn("request startup", await asyncio.wait_for(self.messages.get(), 0.5))
         self.assertEqual(self.send.call_count, 1)
 
     async def test_reconnect_recovers_previous_and_newly_loaded_threads_once(self):
@@ -198,6 +214,78 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 ["missed-from-gone", "missed-from-new"],
             )
         self.assertEqual(self.send.call_count, 3)
+
+    async def test_reconnect_recovers_later_visible_turn_after_delivering_an_earlier_one(self):
+        self.fixture.loaded_pages = [[]]
+        async with self.running_monitor() as client:
+            await self.wait_for(lambda: self.fixture.requests["thread/loaded/list"] >= 1)
+            await client.close()
+            self.fixture.loaded_pages = [["thread"]]
+            first = self.recent("already-visible")
+            self.fixture.histories["thread"] = [[first]]
+            await asyncio.wait_for(self.fixture.clients.get(), 3)
+            self.assertIn("request already-visible", await asyncio.wait_for(self.messages.get(), 3))
+            self.fixture.histories["thread"] = [[self.recent("visible-later"), first]]
+            self.assertIn("request visible-later", await asyncio.wait_for(self.messages.get(), 0.5))
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_overlapping_status_events_can_refer_to_two_completions_in_one_second(self):
+        async with self.running_monitor():
+            await self.wait_for(lambda: self.monitor.loading is None)
+            for state in ("active", "idle", "active", "idle"):
+                self.monitor.on_status({"threadId": "thread", "status": {"type": state}})
+            completed_at = time.time()
+            first = completion("same-second-first", completed_at=completed_at)
+            self.fixture.histories["thread"] = [[first]]
+            self.assertIn("request same-second-first", await asyncio.wait_for(self.messages.get(), 2))
+            second = completion("same-second-second", completed_at=completed_at)
+            self.fixture.histories["thread"] = [[second, first]]
+            self.assertIn("request same-second-second", await asyncio.wait_for(self.messages.get(), 2))
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_available_completion_survives_a_failure_fetching_an_older_page(self):
+        self.fixture.histories["thread"] = [
+            [self.recent("available")], AppServerError("older page unavailable"),
+        ]
+        async with self.running_monitor() as client:
+            await self.fixture.status(client, "thread", "idle")
+            self.assertIn("request available", await asyncio.wait_for(self.messages.get(), 0.5))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_large_summary_does_not_disconnect_the_monitor(self):
+        turn = self.recent("large")
+        turn["items"][0]["content"][0]["text"] += "a" * (1024 * 1024)
+        self.fixture.histories["thread"] = [[turn]]
+        async with self.running_monitor() as client:
+            await self.fixture.status(client, "thread", "idle")
+            self.assertIn("request large", await asyncio.wait_for(self.messages.get(), 0.5))
+            self.assertEqual(self.fixture.requests["initialize"], 1)
+
+    async def test_busy_history_workers_do_not_expire_a_turn_before_its_first_lookup(self):
+        occupied = set()
+        release = asyncio.Event()
+        process_turn = Monitor.process_turn
+
+        async def block_other_turns(monitor, thread_id, turn):
+            if thread_id == "queued":
+                await process_turn(monitor, thread_id, turn)
+            else:
+                occupied.add(thread_id)
+                await release.wait()
+
+        with patch.object(Monitor, "process_turn", block_other_turns), patch("monitor.HISTORY_TIMEOUT", 0.3):
+            async with self.running_monitor() as client:
+                for index in range(8):
+                    thread_id = f"busy-{index}"
+                    self.fixture.histories[thread_id] = [[self.recent(thread_id)]]
+                    await self.fixture.status(client, thread_id, "idle")
+                await self.wait_for(lambda: len(occupied) == 8)
+                self.fixture.histories["queued"] = [[self.recent("queued")]]
+                await self.fixture.status(client, "queued", "idle")
+                await self.wait_for(lambda: "queued" in self.monitor.pending)
+                await asyncio.sleep(0.35)
+                release.set()
+                self.assertIn("request queued", await asyncio.wait_for(self.messages.get(), 2))
 
     async def test_filters_and_metadata_error_do_not_stop_other_turns(self):
         self.fixture.loaded_pages = [["short", "excluded", "archive", "ephemeral", "temp", "goal", "bad", "ok"]]
@@ -229,10 +317,11 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         for policy, expected in (("notify", 1), ("skip", 0), ("error", 0)):
             with self.subTest(policy=policy):
                 before = self.send.call_count
-                self.fixture.loaded_pages = [["archived", "missing"]]
+                self.fixture.loaded_pages = [["archived", "missing", "temporary"]]
                 self.fixture.metadata = {
                     "archived": {"archived": True, "ephemeral": True, "goal": "active"},
                     "missing": {"read_failure": True, "list_missing": True, "goal_failure": True},
+                    "temporary": {"history_unavailable": True},
                 }
                 self.fixture.histories = {name: [[self.recent(name)]] for name in self.fixture.loaded_pages[0]}
                 async with self.running_monitor(
@@ -241,7 +330,9 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                         "skip_ephemeral": False, "skip_archived": False, "on_lookup_failure": policy,
                     },
                 ):
-                    await self.wait_for(lambda: len(self.monitor.processed) == 2)
+                    await self.wait_for(
+                        lambda: len(self.monitor.processed) == 2 and "temporary" not in self.monitor.pending
+                    )
                     await self.monitor.notifier.drain()
                 self.assertEqual(self.send.call_count - before, expected + 1)
         self.assertEqual(self.fixture.requests["thread/goal/get"], 0)
