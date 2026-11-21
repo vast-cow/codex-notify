@@ -46,11 +46,10 @@ Each flag alerts once while it stays active. Once it clears, a later occurrence 
 
 ## Notification filters
 
-The monitor confirms a turn's result using `thread/turns/list`. It uses the text from the persisted user messages and the last non-commentary assistant message in the summary. Formatting, truncation, thread links, and destination settings use the same configuration keys as v1. See [config.example.json](../config.example.json) for the full set of options.
+The monitor confirms a turn's result using `thread/turns/list` and evaluates successfully completed turns for notification regardless of their duration. It uses the text from the persisted user messages and the last non-commentary assistant message in the summary. Formatting, truncation, thread links, and destination settings use the same configuration keys as v1. See [config.example.json](../config.example.json) for the full set of options.
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
-| `notification.min_turn_duration_minutes` | `1` | Applies to completion notifications. Uses `durationMs` and suppresses turns below the threshold or with an unknown duration. Set to `0` to disable the duration filter. |
 | `notification.excluded_project_paths` | `[]` | Suppresses exact working-directory matches after expanding `~` and normalizing paths. |
 | `app_server.skip_ephemeral` | `true` | Suppresses known ephemeral threads. Completion notifications require readable history even when this filter is disabled. |
 | `app_server.skip_archived` | `true` | Suppresses archived threads. Archive membership requires an exact thread ID match in `thread/list`. |

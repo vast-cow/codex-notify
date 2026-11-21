@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 
 from app_server import AppServerError, ConnectionLost, RpcError, lookup_thread, pages
-from notifications import WAITING_LABELS, is_turn_duration_filtered
+from notifications import WAITING_LABELS
 
 
 HISTORY_TIMEOUT = 30
@@ -284,14 +284,8 @@ class Monitor:
         return confirmed, unresolved
 
     async def process_turn(self, thread_id, turn):
-        turn_id = turn.get("id")
-        if is_turn_duration_filtered(
-            turn.get("durationMs"), self.notifier.min_turn_duration,
-            log_context={"thread_id": thread_id, "turn_id": turn_id},
-        ):
-            return
         metadata = await self.notification_metadata(
-            thread_id, turn_id=turn_id, check_goal=self.notifier.skip_active_goals,
+            thread_id, turn_id=turn.get("id"), check_goal=self.notifier.skip_active_goals,
         )
         if metadata is not None:
             self.notifier.notify(thread_id, metadata.cwd, turn)

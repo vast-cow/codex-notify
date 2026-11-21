@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import main
 import notifications
 
 
@@ -92,32 +93,23 @@ class FormattingTests(unittest.TestCase):
         self.assertIn(expected, message)
 
 
-class FilterTests(unittest.TestCase):
-    def test_duration_default_and_custom_boundaries(self):
-        for minutes, duration_ms, filtered in (
-            (1, 59_999, True), (1, 60_000, False), (1, 60_001, False),
-            (1.5, 89_999, True), (1.5, 90_000, False),
-            (0, None, False), (1, None, True), (1, -1, True), (1, False, True),
-            (1, "60001", True), (1, 60001.0, True), (1e-100, 1, False),
-        ):
-            with self.subTest(minutes=minutes, duration_ms=duration_ms):
-                self.assertEqual(notifications.is_turn_duration_filtered(duration_ms, minutes), filtered)
-        self.assertEqual(notifications.Notifier({}).min_turn_duration, 1)
-
-    def test_invalid_duration_thresholds(self):
-        for value in ("1", True, -1, None, float("inf"), float("nan"), {}):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "min_turn_duration_minutes"):
-                notifications.Notifier({"notification": {"min_turn_duration_minutes": value}})
-
-    def test_config_keeps_decimal_precision(self):
-        with tempfile.TemporaryDirectory() as directory:
+class StartupTests(unittest.TestCase):
+    def test_starts_with_legacy_duration_setting(self):
+        with tempfile.TemporaryDirectory() as directory, patch("sys.argv", ["main.py"]), \
+                patch("main.logging.basicConfig"), patch("main.log"):
             path = Path(directory) / "config.json"
-            path.write_text('{"notification":{"min_turn_duration_minutes":1.000000000000000001}}')
-            with patch.object(notifications, "CONFIG_PATH", path):
-                notifier = notifications.Notifier(notifications.load_config())
-        self.assertTrue(notifications.is_turn_duration_filtered(60_000, notifier.min_turn_duration))
-        self.assertFalse(notifications.is_turn_duration_filtered(60_001, notifier.min_turn_duration))
+            for value in (1.25, -1, "unused", True, None, {}):
+                with self.subTest(value=value), patch.object(notifications, "CONFIG_PATH", path), \
+                        patch.object(main.Monitor, "run") as run:
+                    path.write_text(json.dumps({
+                        "notification": {"min_turn_duration_minutes": value},
+                        "app_server": {"endpoint": "ws://127.0.0.1:8765", "timeout_seconds": 1.5},
+                    }), encoding="utf-8")
+                    self.assertEqual(main.main(), 0)
+                    run.assert_awaited_once()
 
+
+class FilterTests(unittest.TestCase):
     def test_path_filter_uses_exact_normalized_matches(self):
         notifier = notifications.Notifier({"notification": {
             "excluded_project_paths": ["~/project//", "/projects/demo/../excluded"],

@@ -178,7 +178,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         return completion(turn_id, completed_at=time.time(), **kwargs)
 
     async def test_sends_input_and_approval_alerts_before_completion(self):
-        options = {"min_turn_duration_minutes": 2, "thread_url_template": "codex://threads/{thread_id}"}
+        options = {"thread_url_template": "codex://threads/{thread_id}"}
         input_label = "Waiting for user input"
         approval_label = "Waiting for approval or MCP input"
         cases = (
@@ -198,8 +198,8 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                         f"📁 Project: example\n📂 Path: /projects/example\n\n🔗 Thread: codex://threads/{thread_id}",
                     )
             self.assertEqual(self.fixture.requests["thread/goal/get"], 0)
-            self.fixture.metadata["both"]["goal"] = None
-            self.fixture.histories["both"] = [[self.recent("both", duration=120_000)]]
+            self.fixture.metadata["both"]["goal"] = "complete"
+            self.fixture.histories["both"] = [[self.recent("both", duration=59_999)]]
             await self.fixture.status(client, "both", "idle")
             self.assertIn("✅ Codex CLI - Task done", await asyncio.wait_for(self.messages.get(), 1))
         self.assertEqual(self.send.call_count, 4)
@@ -509,8 +509,9 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("request queued", await asyncio.wait_for(self.messages.get(), 2))
 
     async def test_filters_and_metadata_error_do_not_stop_other_turns(self):
-        self.fixture.loaded_pages = [["short", "excluded", "archive", "ephemeral", "temp", "goal", "bad", "ok"]]
+        self.fixture.loaded_pages = [["unknown", "excluded", "archive", "ephemeral", "temp", "goal", "bad", "ok"]]
         self.fixture.metadata.update({
+            "unknown": {"goal": "complete"},
             "excluded": {"cwd": "/projects/hidden"},
             "archive": {"archived": True},
             "ephemeral": {"ephemeral": True},
@@ -519,22 +520,25 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             "bad": {"goal_failure": True},
         })
         self.fixture.histories = {name: [[self.recent(f"turn-{name}")]] for name in self.fixture.loaded_pages[0]}
-        self.fixture.histories["short"] = [[self.recent("turn-short", duration=59_999)]]
+        self.fixture.histories["unknown"] = [[self.recent("turn-unknown", duration=None)]]
         with self.assertLogs("notify", level="INFO") as logs:
             async with self.running_monitor(
                 notification={"excluded_project_paths": ["/projects/hidden/"]},
                 server_overrides={"on_lookup_failure": "error"},
             ) as client:
                 await self.wait_for(lambda: len(self.monitor.processed) == 7)
-                self.assertIn("request turn-ok", await asyncio.wait_for(self.messages.get(), 3))
+                messages = [await asyncio.wait_for(self.messages.get(), 3) for _ in range(2)]
+                self.assertCountEqual(
+                    [message.split("request ")[1].splitlines()[0] for message in messages],
+                    ["turn-ok", "turn-unknown"],
+                )
                 self.fixture.histories["later"] = [[self.recent("later")]]
                 await self.fixture.status(client, "later", "idle")
                 self.assertIn("request later", await asyncio.wait_for(self.messages.get(), 3))
-        self.assertEqual(self.send.call_count, 2)
+        self.assertEqual(self.send.call_count, 3)
         diagnostics = [MonitorFormatter().format(record) for record in logs.records
                        if record.getMessage().startswith(("Skipped", "App-server lookup incomplete"))]
         self.assertCountEqual(diagnostics, [
-            "Skipped turn with duration 59999 ms below the 1-minute minimum thread_id='short' turn_id='turn-short'",
             "Skipped notification from an excluded project thread_id='excluded' turn_id='turn-excluded'",
             "Skipped notification due to archived thread thread_id='archive' turn_id='turn-archive'",
             "Skipped notification due to ephemeral thread thread_id='ephemeral' turn_id='turn-ephemeral'",

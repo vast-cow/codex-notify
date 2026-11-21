@@ -7,13 +7,10 @@ import math
 import os
 import urllib.error
 import urllib.request
-from decimal import Decimal, InvalidOperation
-from fractions import Fraction
 from pathlib import Path
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
-MIN_TURN_DURATION_KEY = "min_turn_duration_minutes"
 WAITING_LABELS = {
     "waitingOnUserInput": "Waiting for user input",
     "waitingOnApproval": "Waiting for approval or MCP input",
@@ -21,20 +18,9 @@ WAITING_LABELS = {
 log = logging.getLogger("notify")
 
 
-def _decode_config_object(options):
-    # Keep the threshold's decimal precision and preserve float behavior for other settings.
-    for key, value in options.items():
-        if key != MIN_TURN_DURATION_KEY and isinstance(value, Decimal):
-            options[key] = float(value)
-    return options
-
-
 def load_config():
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        try:
-            return json.load(f, parse_float=Decimal, object_hook=_decode_config_object)
-        except InvalidOperation as error:
-            raise ValueError("invalid number in config.json") from error
+        return json.load(f)
 
 
 def excluded_paths(options):
@@ -51,36 +37,6 @@ def excluded_paths(options):
 
 def normalize_path(path):
     return os.path.abspath(os.path.expanduser(path))
-
-
-def min_turn_duration(options):
-    minutes = options.get(MIN_TURN_DURATION_KEY, 1)
-    if (
-        type(minutes) not in (int, float, Decimal)
-        or (type(minutes) is float and not math.isfinite(minutes))
-        or (type(minutes) is Decimal and not minutes.is_finite())
-        or minutes < 0
-    ):
-        raise ValueError("notification.min_turn_duration_minutes must be a finite non-negative number")
-    return minutes
-
-
-def is_turn_duration_filtered(duration_ms, minutes, *, log_context=None):
-    if minutes == 0:
-        return False
-    if type(duration_ms) is not int or duration_ms < 0:
-        log.info("Skipped turn with unknown duration", extra=log_context)
-        return True
-
-    # One millisecond meets any positive threshold below 0.00001 minutes.
-    # The bounds avoid constructing fractions for extreme exponents.
-    if duration_ms == 0 or minutes > duration_ms or (
-        minutes >= Decimal("0.00001") and duration_ms < Fraction(str(minutes)) * 60_000
-    ):
-        log.info("Skipped turn with duration %s ms below the %s-minute minimum", duration_ms, minutes,
-                 extra=log_context)
-        return True
-    return False
 
 
 def post_json(url, payload, timeout=10):
@@ -254,7 +210,6 @@ class Notifier:
         options = config.get("notification", {})
         self.config = config
         self.excluded_paths = excluded_paths(options)
-        self.min_turn_duration = min_turn_duration(options)
         self.skip_active_goals = options.get("skip_active_goals", True)
         if not isinstance(self.skip_active_goals, bool):
             raise ValueError("notification.skip_active_goals must be a boolean")

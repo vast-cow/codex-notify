@@ -12,7 +12,6 @@
     "title": "Codex CLI",
     "include_project": true,
     "excluded_project_paths": [],
-    "min_turn_duration_minutes": 1,
     "skip_active_goals": true,
     "include_input": true,
     "include_output": true,
