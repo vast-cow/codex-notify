@@ -34,6 +34,8 @@ Monitor logs and configuration errors go to standard error. Each entry starts wi
 
 Use `thread_id` to follow history checks and lookup failures for a thread. Use `turn_id` to narrow completion and exclusion logs to one turn. IDs appear when available. Action-required delivery logs identify the thread, and each delivery result names the destination and records the notification type. Debug logs include diagnostic state and IDs. Notification text and destination credentials stay out of delivery and debug logs.
 
+A completion that still has a missing or invalid timestamp or item summary at the end of the retry window produces a warning with both IDs. With `app_server.on_lookup_failure` set to `error`, it produces an error instead.
+
 ## Action-required notifications
 
 During a turn, the monitor watches `activeFlags` in live `thread/status/changed` events. In Codex 0.171.0, `waitingOnUserInput` signals a Plan mode question. `waitingOnApproval` can signal an MCP input request or a permission approval, including for commands and file changes. [Codex event handling](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/app-server/src/bespoke_event_handling.rs#L875-L998)

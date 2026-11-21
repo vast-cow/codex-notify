@@ -181,6 +181,7 @@ class Monitor:
         try:
             while True:
                 failure = None
+                incomplete_turns = {}
                 try:
                     async with self.slots:
                         check = self.pending[thread_id]
@@ -190,7 +191,9 @@ class Monitor:
                             deadline = loop.time() + HISTORY_TIMEOUT
                             confirmed = False
                             log.debug("Turn history check started (reconcile=%s)", check.reconcile, extra=context)
-                        observed, unresolved = await self.scan_history(thread_id, check.since, deadline)
+                        observed, unresolved = await self.scan_history(
+                            thread_id, check.since, deadline, incomplete_turns,
+                        )
                     confirmed |= observed
                     retry = check.reconcile or unresolved or not confirmed
                 except ConnectionLost as exc:
@@ -210,12 +213,16 @@ class Monitor:
                 if self.pending[thread_id] is not check:
                     log.debug("Turn history check superseded by a new signal", extra=context)
                     continue
-                remaining = deadline - loop.time()
-                if not retry or remaining <= POLL_INTERVAL:
+                finished = not retry or deadline - loop.time() <= POLL_INTERVAL
+                report = log.error if self.settings.on_lookup_failure == "error" else log.warning
+                report_issue = report if finished else log.debug
+                for turn_id, reason in incomplete_turns.items():
+                    report_issue("Turn history is incomplete (%s)", reason,
+                                 extra={"thread_id": thread_id, "turn_id": turn_id})
+                if finished:
                     if failure:
-                        report = log.error if self.settings.on_lookup_failure == "error" else log.warning
                         report("Turn history unavailable (%s)", failure, extra=context)
-                    elif retry and not check.reconcile:
+                    elif retry and not check.reconcile and not incomplete_turns:
                         log.info("Turn history did not confirm the completion within the retry window",
                                  extra=context)
                     self.pending.pop(thread_id)
@@ -227,7 +234,7 @@ class Monitor:
             self.scans.pop(thread_id, None)
             log.debug("Turn history check ended", extra=context)
 
-    async def scan_history(self, thread_id, since, deadline):
+    async def scan_history(self, thread_id, since, deadline, incomplete_turns):
         confirmed = False
         unresolved = False
         malformed = False
@@ -254,10 +261,11 @@ class Monitor:
                     started = timestamp(turn.get("startedAt"))
                     if started is None or started >= since or status == "inProgress":
                         unresolved = True
+                        if status == "completed":
+                            incomplete_turns[turn_id] = "missing or invalid completion timestamp"
                     continue
                 if status == "completed" and not isinstance(turn.get("items"), list):
-                    log.debug("Completed turn is missing its item summary",
-                              extra={"thread_id": thread_id, "turn_id": turn_id})
+                    incomplete_turns[turn_id] = "missing or invalid item summary"
                     unresolved = True
                     continue
                 log.debug("Turn history found a terminal turn (status=%s)", status,
@@ -265,6 +273,7 @@ class Monitor:
                 if status == "completed":
                     await self.process_turn(thread_id, turn)
                 self.processed.add(key)
+                incomplete_turns.pop(turn_id, None)
                 confirmed |= completed_at >= since
             if reached_startup:
                 # The history is ordered newest-first.

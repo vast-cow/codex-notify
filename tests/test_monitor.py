@@ -456,6 +456,23 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             "Turn history unavailable (thread/turns/list failed (JSON-RPC error -32600)) thread_id='thread'",
         ])
 
+    async def test_expired_history_checks_report_incomplete_completions_with_ids(self):
+        no_summary = self.recent("no-summary")
+        del no_summary["items"]
+        self.fixture.loaded_pages = [["thread"]]
+        self.fixture.histories["thread"] = [[
+            no_summary, completion("no-timestamp"), completion("running", status="inProgress"),
+        ]]
+        with self.assertLogs("notify", "WARNING") as logs, patch("monitor.HISTORY_TIMEOUT", 0.15):
+            async with self.running_monitor():
+                await self.wait_for(lambda: self.monitor.loading is None and not self.monitor.scans)
+        self.assertEqual(self.send.call_count, 0)
+        self.assertCountEqual([MonitorFormatter().format(record) for record in logs.records], [
+            "Turn history is incomplete (missing or invalid item summary) thread_id='thread' turn_id='no-summary'",
+            "Turn history is incomplete (missing or invalid completion timestamp) "
+            "thread_id='thread' turn_id='no-timestamp'",
+        ])
+
     async def test_large_summary_does_not_disconnect_the_monitor(self):
         turn = self.recent("large")
         turn["items"][0]["content"][0]["text"] += "a" * (1024 * 1024)
