@@ -15,6 +15,7 @@ from websockets.asyncio.server import serve, unix_serve
 from websockets.exceptions import ConnectionClosedOK
 
 from app_server import AppServerError, Settings, WebSocketClient
+from main import MonitorFormatter
 from monitor import Monitor
 from notifications import Notifier
 
@@ -445,10 +446,15 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.fixture.histories["thread"] = [
             [self.recent("available")], AppServerError("older page unavailable"),
         ]
-        async with self.running_monitor() as client:
-            await self.fixture.status(client, "thread", "idle")
-            self.assertIn("request available", await asyncio.wait_for(self.messages.get(), 0.5))
+        with self.assertLogs("notify", "WARNING") as logs, patch("monitor.HISTORY_TIMEOUT", 0.15):
+            async with self.running_monitor() as client:
+                await self.fixture.status(client, "thread", "idle")
+                self.assertIn("request available", await asyncio.wait_for(self.messages.get(), 0.5))
+                await self.wait_for(lambda: "thread" not in self.monitor.scans)
         self.assertEqual(self.send.call_count, 1)
+        self.assertEqual([MonitorFormatter().format(record) for record in logs.records], [
+            "Turn history unavailable (thread/turns/list failed (JSON-RPC error -32600)) thread_id='thread'",
+        ])
 
     async def test_large_summary_does_not_disconnect_the_monitor(self):
         turn = self.recent("large")
@@ -495,20 +501,31 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             "goal": {"goal": "active"},
             "bad": {"goal_failure": True},
         })
-        self.fixture.histories = {name: [[self.recent(name)]] for name in self.fixture.loaded_pages[0]}
-        self.fixture.histories["short"] = [[self.recent("short", duration=59_999)]]
-        with self.assertLogs("notify", level="ERROR") as logs:
+        self.fixture.histories = {name: [[self.recent(f"turn-{name}")]] for name in self.fixture.loaded_pages[0]}
+        self.fixture.histories["short"] = [[self.recent("turn-short", duration=59_999)]]
+        with self.assertLogs("notify", level="INFO") as logs:
             async with self.running_monitor(
                 notification={"excluded_project_paths": ["/projects/hidden/"]},
                 server_overrides={"on_lookup_failure": "error"},
             ) as client:
                 await self.wait_for(lambda: len(self.monitor.processed) == 7)
-                self.assertIn("request ok", await asyncio.wait_for(self.messages.get(), 3))
+                self.assertIn("request turn-ok", await asyncio.wait_for(self.messages.get(), 3))
                 self.fixture.histories["later"] = [[self.recent("later")]]
                 await self.fixture.status(client, "later", "idle")
                 self.assertIn("request later", await asyncio.wait_for(self.messages.get(), 3))
         self.assertEqual(self.send.call_count, 2)
-        self.assertIn("on_lookup_failure=error", "\n".join(logs.output))
+        diagnostics = [MonitorFormatter().format(record) for record in logs.records
+                       if record.getMessage().startswith(("Skipped", "App-server lookup incomplete"))]
+        self.assertCountEqual(diagnostics, [
+            "Skipped turn with duration 59999 ms below the 1-minute minimum thread_id='short' turn_id='turn-short'",
+            "Skipped notification from an excluded project thread_id='excluded' turn_id='turn-excluded'",
+            "Skipped notification due to archived thread thread_id='archive' turn_id='turn-archive'",
+            "Skipped notification due to ephemeral thread thread_id='ephemeral' turn_id='turn-ephemeral'",
+            "Skipped turn history (thread history is unavailable for ephemeral threads) thread_id='temp'",
+            "Skipped notification due to active goal thread_id='goal' turn_id='turn-goal'",
+            "App-server lookup incomplete for active goal (on_lookup_failure=error; "
+            "thread/goal/get failed (JSON-RPC error -32600)) thread_id='bad' turn_id='turn-bad'",
+        ])
         self.assertNotIn("private goal", "\n".join(logs.output))
 
     async def test_other_lookup_policies_and_disabled_filters(self):
@@ -538,24 +555,43 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_slow_delivery_does_not_block_events_or_another_destination(self):
         release = threading.Event()
         started = asyncio.Event()
+        self.fixture.histories["done"] = [[self.recent("completed-turn")]]
+        self.fixture.histories["excluded"] = [[self.recent("excluded-turn")]]
+        self.fixture.metadata["excluded"] = {"archived": True}
 
-        def slow_telegram(_config, _message, _timeout):
+        def slow_telegram(_config, message, _timeout):
+            if "Action required" not in message:
+                raise RuntimeError("private delivery details")
             self.loop.call_soon_threadsafe(started.set)
             release.wait(3)
 
-        with patch("notifications.send_telegram", side_effect=slow_telegram):
+        with self.assertLogs("notify") as logs, patch("notifications.send_telegram", side_effect=slow_telegram):
             async with self.running_monitor(telegram={"enabled": True}) as client:
                 try:
-                    self.fixture.histories["first"] = [[self.recent("first")]]
-                    await self.fixture.status(client, "first", "idle")
+                    await self.fixture.status(client, "waiting", "active", USER_INPUT)
                     await asyncio.wait_for(started.wait(), 3)
-                    self.fixture.histories["second"] = [[self.recent("second")]]
-                    await self.fixture.status(client, "second", "idle")
-                    self.assertIn("request first", await asyncio.wait_for(self.messages.get(), 3))
-                    self.assertIn("request second", await asyncio.wait_for(self.messages.get(), 3))
-                    self.assertFalse(release.is_set())
+                    self.assertIn("Action required", await asyncio.wait_for(self.messages.get(), 3))
+                    await self.fixture.status(client, "done", "idle")
+                    await self.fixture.status(client, "excluded", "active", APPROVAL)
+                    await self.wait_for(lambda: "excluded" in self.monitor.waiting_flags
+                                        and "excluded" not in self.monitor.action_checks)
+                    await self.fixture.status(client, "excluded", "idle")
+                    self.assertIn("request completed-turn", await asyncio.wait_for(self.messages.get(), 3))
+                    await self.wait_for(lambda: ("excluded", "excluded-turn") in self.monitor.processed)
+                    await self.wait_for(lambda: any("Telegram delivery failed" in entry for entry in logs.output))
                 finally:
                     release.set()
+        diagnostics = [MonitorFormatter().format(record) for record in logs.records
+                       if record.getMessage() != "Monitoring shared app-server"]
+        self.assertCountEqual(diagnostics, [
+            "Slack notification sent thread_id='waiting' notification_type='action_required'",
+            "Telegram notification sent thread_id='waiting' notification_type='action_required'",
+            "Slack notification sent thread_id='done' turn_id='completed-turn' notification_type='completion'",
+            "Telegram delivery failed (RuntimeError) thread_id='done' turn_id='completed-turn' "
+            "notification_type='completion'",
+            "Skipped notification due to archived thread thread_id='excluded'",
+            "Skipped notification due to archived thread thread_id='excluded' turn_id='excluded-turn'",
+        ])
 
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets unavailable")
     async def test_unix_websocket_receives_completion(self):

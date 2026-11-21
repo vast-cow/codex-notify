@@ -67,6 +67,8 @@ class Monitor:
         if state not in ("active", "idle", "systemError", "notLoaded"):
             return
         self.update_waiting_flags(thread_id, status.get("activeFlags") if state == "active" else [])
+        log.debug("Thread status changed: state=%s waiting_flags=%s",
+                  state, sorted(self.waiting_flags.get(thread_id, ())), extra={"thread_id": thread_id})
         if self.loading is not None:
             self.loading[thread_id] = state
         if state == "notLoaded":
@@ -173,6 +175,7 @@ class Monitor:
 
     async def check_history(self, thread_id):
         loop = asyncio.get_running_loop()
+        context = {"thread_id": thread_id}
         last_check = None
         confirmed = False
         try:
@@ -186,15 +189,17 @@ class Monitor:
                             # Queueing behind other threads must not consume the first attempt.
                             deadline = loop.time() + HISTORY_TIMEOUT
                             confirmed = False
+                            log.debug("Turn history check started (reconcile=%s)", check.reconcile, extra=context)
                         observed, unresolved = await self.scan_history(thread_id, check.since, deadline)
                     confirmed |= observed
                     retry = check.reconcile or unresolved or not confirmed
-                except ConnectionLost:
+                except ConnectionLost as exc:
+                    log.debug("Turn history check interrupted (%s)", exc, extra=context)
                     return
                 except RpcError as exc:
                     retry = not (exc.ephemeral_history or exc.code in (-32601, -32602))
                     if exc.ephemeral_history:
-                        log.info("Skipped turn history (%s)", exc)
+                        log.info("Skipped turn history (%s)", exc, extra=context)
                     else:
                         failure = str(exc)
                 except (AppServerError, asyncio.TimeoutError) as exc:
@@ -203,19 +208,24 @@ class Monitor:
 
                 # A new completion signal can arrive while a history request is in flight.
                 if self.pending[thread_id] is not check:
+                    log.debug("Turn history check superseded by a new signal", extra=context)
                     continue
                 remaining = deadline - loop.time()
                 if not retry or remaining <= POLL_INTERVAL:
                     if failure:
                         report = log.error if self.settings.on_lookup_failure == "error" else log.warning
-                        report("Turn history unavailable (%s)", failure)
+                        report("Turn history unavailable (%s)", failure, extra=context)
                     elif retry and not check.reconcile:
-                        log.info("Turn history did not confirm the completion within the retry window")
+                        log.info("Turn history did not confirm the completion within the retry window",
+                                 extra=context)
                     self.pending.pop(thread_id)
                     return
+                log.debug("Retrying turn history check (%s)", failure or "checking for more completions",
+                          extra=context)
                 await asyncio.sleep(POLL_INTERVAL)
         finally:
             self.scans.pop(thread_id, None)
+            log.debug("Turn history check ended", extra=context)
 
     async def scan_history(self, thread_id, since, deadline):
         confirmed = False
@@ -235,7 +245,8 @@ class Monitor:
                 if completed_at is not None and completed_at <= self.started_at:
                     reached_startup = True
                     continue
-                key = (thread_id, turn["id"])
+                turn_id = turn["id"]
+                key = (thread_id, turn_id)
                 if key in self.processed:
                     continue
                 status = turn.get("status")
@@ -245,8 +256,12 @@ class Monitor:
                         unresolved = True
                     continue
                 if status == "completed" and not isinstance(turn.get("items"), list):
+                    log.debug("Completed turn is missing its item summary",
+                              extra={"thread_id": thread_id, "turn_id": turn_id})
                     unresolved = True
                     continue
+                log.debug("Turn history found a terminal turn (status=%s)", status,
+                          extra={"thread_id": thread_id, "turn_id": turn_id})
                 if status == "completed":
                     await self.process_turn(thread_id, turn)
                 self.processed.add(key)
@@ -260,16 +275,27 @@ class Monitor:
         return confirmed, unresolved
 
     async def process_turn(self, thread_id, turn):
-        if is_turn_duration_filtered(turn.get("durationMs"), self.notifier.min_turn_duration):
+        turn_id = turn.get("id")
+        if is_turn_duration_filtered(
+            turn.get("durationMs"), self.notifier.min_turn_duration,
+            log_context={"thread_id": thread_id, "turn_id": turn_id},
+        ):
             return
-        metadata = await self.notification_metadata(thread_id, check_goal=self.notifier.skip_active_goals)
+        metadata = await self.notification_metadata(
+            thread_id, turn_id=turn_id, check_goal=self.notifier.skip_active_goals,
+        )
         if metadata is not None:
             self.notifier.notify(thread_id, metadata.cwd, turn)
 
-    async def notification_metadata(self, thread_id, *, check_goal=False):
-        metadata = await lookup_thread(self.rpc, self.settings, thread_id, check_goal=check_goal)
+    async def notification_metadata(self, thread_id, *, turn_id=None, check_goal=False):
+        context = {"thread_id": thread_id, "turn_id": turn_id}
+        try:
+            metadata = await lookup_thread(self.rpc, self.settings, thread_id, check_goal=check_goal)
+        except ConnectionLost as exc:
+            log.debug("App-server lookup interrupted (%s)", exc, extra=context)
+            raise
         if self.notifier.is_project_excluded(metadata.cwd):
-            log.info("Skipped notification from an excluded project")
+            log.info("Skipped notification from an excluded project", extra=context)
             return
 
         states = {}
@@ -281,7 +307,7 @@ class Monitor:
             states["active goal"] = metadata.active_goal
         for name, state in states.items():
             if state is True:
-                log.info("Skipped notification due to %s", name)
+                log.info("Skipped notification due to %s", name, extra=context)
                 return
 
         unknown = [name for name, state in states.items() if state is None]
@@ -294,6 +320,7 @@ class Monitor:
                 "App-server lookup incomplete for %s (on_lookup_failure=%s%s)",
                 ", ".join(unknown), action,
                 "; " + ", ".join(dict.fromkeys(metadata.failures)) if metadata.failures else "",
+                extra=context,
             )
             if action != "notify":
                 return

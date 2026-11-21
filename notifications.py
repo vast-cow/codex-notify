@@ -65,11 +65,11 @@ def min_turn_duration(options):
     return minutes
 
 
-def is_turn_duration_filtered(duration_ms, minutes):
+def is_turn_duration_filtered(duration_ms, minutes, *, log_context=None):
     if minutes == 0:
         return False
     if type(duration_ms) is not int or duration_ms < 0:
-        log.info("Skipped turn with unknown duration")
+        log.info("Skipped turn with unknown duration", extra=log_context)
         return True
 
     # One millisecond meets any positive threshold below 0.00001 minutes.
@@ -77,7 +77,8 @@ def is_turn_duration_filtered(duration_ms, minutes):
     if duration_ms == 0 or minutes > duration_ms or (
         minutes >= Decimal("0.00001") and duration_ms < Fraction(str(minutes)) * 60_000
     ):
-        log.info("Skipped turn with duration %s ms below the %s-minute minimum", duration_ms, minutes)
+        log.info("Skipped turn with duration %s ms below the %s-minute minimum", duration_ms, minutes,
+                 extra=log_context)
         return True
     return False
 
@@ -269,7 +270,7 @@ class Notifier:
 
     def notify(self, thread_id, cwd, turn):
         message = format_message(event_from_summary(thread_id, cwd, turn), self.config)
-        self.send(message)
+        self.send(message, notification_type="completion", thread_id=thread_id, turn_id=turn.get("id"))
 
     def notify_action_required(self, thread_id, cwd, flags):
         options = self.config.get("notification", {})
@@ -278,23 +279,24 @@ class Notifier:
         lines.extend(label for flag, label in WAITING_LABELS.items() if flag in flags)
         lines.extend(project_lines(cwd, options))
         lines.extend(thread_link_lines(thread_id, options))
-        self.send("\n".join(lines))
+        self.send("\n".join(lines), notification_type="action_required", thread_id=thread_id)
 
-    def send(self, message):
+    def send(self, message, *, notification_type, thread_id, turn_id=None):
+        context = {"thread_id": thread_id, "turn_id": turn_id, "notification_type": notification_type}
         for name, sender in (("Telegram", send_telegram), ("Slack", send_slack)):
             target = self.config.get(name.lower(), {})
             if target.get("enabled", False):
-                task = asyncio.create_task(self.deliver(name, sender, target, message))
+                task = asyncio.create_task(self.deliver(name, sender, target, message, context))
                 self.deliveries.add(task)
                 task.add_done_callback(self.deliveries.discard)
 
-    async def deliver(self, name, sender, target, message):
+    async def deliver(self, name, sender, target, message, context):
         try:
             await asyncio.get_running_loop().run_in_executor(None, sender, target, message, self.timeout)
         except Exception as exc:
-            log.error("%s delivery failed (%s)", name, type(exc).__name__)
+            log.error("%s delivery failed (%s)", name, type(exc).__name__, extra=context)
         else:
-            log.info("%s notification sent", name)
+            log.info("%s notification sent", name, extra=context)
 
     async def drain(self):
         await asyncio.gather(*self.deliveries)

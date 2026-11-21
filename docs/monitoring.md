@@ -14,6 +14,26 @@ codex --remote "unix://$HOME/.codex-notify-sockets/app-server.sock"
 
 Set `app_server.endpoint` to the expanded absolute socket path, such as `unix:///home/alice/.codex-notify-sockets/app-server.sock`. The endpoint is required. The legacy `app_server.enabled` setting is ignored.
 
+## Starting the monitor and reading logs
+
+Run `python3 main.py` from the project directory to see `INFO`, `WARNING`, and `ERROR` messages. Use `--debug` to also see live thread states, recognized waiting flags, and history check starts, retries, terminal turns, and exits.
+
+```bash
+python3 main.py
+python3 main.py --debug
+python3 main.py --debug 2>> monitor.log
+```
+
+Monitor logs and configuration errors go to standard error. Each entry starts with a local ISO 8601 timestamp with milliseconds and a time zone offset, followed by `[notify]`, the log level, and the diagnostic message.
+
+```text
+2026-11-21T20:53:47.900+09:00 [notify] DEBUG Thread status changed: state=active waiting_flags=['waitingOnUserInput'] thread_id='thread-123'
+2026-11-21T20:53:48.123+09:00 [notify] INFO Slack notification sent thread_id='thread-123' turn_id='turn-456' notification_type='completion'
+2026-11-21T20:53:48.210+09:00 [notify] ERROR Telegram delivery failed (RuntimeError) thread_id='thread-789' notification_type='action_required'
+```
+
+Use `thread_id` to follow history checks and lookup failures for a thread. Use `turn_id` to narrow completion and exclusion logs to one turn. IDs appear when available. Action-required delivery logs identify the thread, and each delivery result names the destination and records the notification type. Debug logs include diagnostic state and IDs. Notification text and destination credentials stay out of delivery and debug logs.
+
 ## Action-required notifications
 
 During a turn, the monitor watches `activeFlags` in live `thread/status/changed` events. In Codex 0.171.0, `waitingOnUserInput` signals a Plan mode question. `waitingOnApproval` can signal an MCP input request or a permission approval, including for commands and file changes. [Codex event handling](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/app-server/src/bespoke_event_handling.rs#L875-L998)
