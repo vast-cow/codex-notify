@@ -19,6 +19,10 @@ from monitor import Monitor
 from notifications import Notifier
 
 
+USER_INPUT = "waitingOnUserInput"
+APPROVAL = "waitingOnApproval"
+
+
 def completion(turn_id, *, status="completed", completed_at=None, duration=60_000):
     return {
         "id": turn_id,
@@ -39,6 +43,7 @@ class Fixture:
         self.loaded_pages = [[]]
         self.histories = {}
         self.metadata = {}
+        self.deferred = {}
 
     async def serve(self, connection):
         async for raw in connection:
@@ -48,12 +53,18 @@ class Fixture:
             if method == "initialized":
                 await self.clients.put(connection)
                 continue
+            params = request["params"]
             try:
-                result = {"result": self.answer(method, request["params"])}
+                result = {"result": self.answer(method, params)}
             except AppServerError as exc:
                 result = {"error": {"code": -32600, "message": str(exc)}}
+            response = json.dumps({"id": request["id"], **result})
+            queue = self.deferred.get((method, params.get("threadId")))
+            if queue is not None:
+                queue.put_nowait(response)
+                continue
             try:
-                await connection.send(json.dumps({"id": request["id"], **result}))
+                await connection.send(response)
             except ConnectionClosedOK:
                 return
 
@@ -76,7 +87,10 @@ class Fixture:
         if method == "thread/read":
             if properties.get("read_failure"):
                 raise AppServerError("private information from the server")
-            return {"thread": {"id": thread_id, "cwd": cwd, "ephemeral": properties.get("ephemeral", False)}}
+            return {"thread": {
+                "id": thread_id, "cwd": cwd, "ephemeral": properties.get("ephemeral", False),
+                "status": properties.get("status", {"type": "idle"}),
+            }}
         if method == "thread/list":
             if properties.get("list_missing"):
                 return {"data": []}
@@ -96,9 +110,12 @@ class Fixture:
         return {"data": pages[index], "nextCursor": str(index + 1) if index + 1 < len(pages) else None}
 
     @staticmethod
-    async def status(client, thread_id, state):
+    async def status(client, thread_id, state, *flags):
+        status = {"type": state}
+        if state == "active":
+            status["activeFlags"] = list(flags)
         await client.send(json.dumps({
-            "method": "thread/status/changed", "params": {"threadId": thread_id, "status": {"type": state}},
+            "method": "thread/status/changed", "params": {"threadId": thread_id, "status": status},
         }))
 
 
@@ -158,6 +175,167 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
 
     def recent(self, turn_id, **kwargs):
         return completion(turn_id, completed_at=time.time(), **kwargs)
+
+    async def test_sends_input_and_approval_alerts_before_completion(self):
+        options = {"min_turn_duration_minutes": 2, "thread_url_template": "codex://threads/{thread_id}"}
+        input_label = "Waiting for user input"
+        approval_label = "Waiting for approval or MCP input"
+        cases = (
+            ("input", (USER_INPUT,), input_label),
+            ("approval", (APPROVAL,), approval_label),
+            ("both", (APPROVAL, USER_INPUT), f"{input_label}\n{approval_label}"),
+        )
+        async with self.running_monitor(notification=options) as client:
+            for thread_id, flags, labels in cases:
+                with self.subTest(thread_id=thread_id):
+                    self.fixture.metadata[thread_id] = {"goal": "active"}
+                    self.fixture.histories[thread_id] = [[completion(thread_id, status="inProgress")]]
+                    await self.fixture.status(client, thread_id, "active", *flags)
+                    self.assertEqual(
+                        await asyncio.wait_for(self.messages.get(), 1),
+                        f"🔔 Codex CLI - Action required\n\n{labels}\n\n"
+                        f"📁 Project: example\n📂 Path: /projects/example\n\n🔗 Thread: codex://threads/{thread_id}",
+                    )
+            self.assertEqual(self.fixture.requests["thread/goal/get"], 0)
+            self.fixture.metadata["both"]["goal"] = None
+            self.fixture.histories["both"] = [[self.recent("both", duration=120_000)]]
+            await self.fixture.status(client, "both", "idle")
+            self.assertIn("✅ Codex CLI - Task done", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 4)
+
+    async def test_suppresses_repeated_flags_until_each_resolves(self):
+        async with self.running_monitor() as client:
+            await self.fixture.status(client, "thread", "active", USER_INPUT)
+            self.assertIn("Waiting for user input", await asyncio.wait_for(self.messages.get(), 1))
+            await self.fixture.status(client, "thread", "active", USER_INPUT, USER_INPUT)
+            await self.fixture.status(client, "thread", "active", USER_INPUT, APPROVAL, "unknownFlag")
+            message = await asyncio.wait_for(self.messages.get(), 1)
+            self.assertIn("Waiting for approval", message)
+            self.assertNotIn("Waiting for user input", message)
+            await self.fixture.status(client, "thread", "active", APPROVAL)
+            await self.fixture.status(client, "thread", "active", USER_INPUT, APPROVAL)
+            message = await asyncio.wait_for(self.messages.get(), 1)
+            self.assertIn("Waiting for user input", message)
+            self.assertNotIn("Waiting for approval", message)
+            await self.fixture.status(client, "thread", "active")
+            await self.fixture.status(client, "thread", "active", APPROVAL)
+            self.assertIn("Waiting for approval", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 4)
+        self.assertEqual(self.fixture.requests["thread/read"], 4)
+
+    async def test_combines_new_flags_during_a_lookup_while_history_is_pending(self):
+        history = asyncio.Queue()
+        self.fixture.loaded_pages = [["thread"] + [f"other-{index}" for index in range(7)]]
+        for thread_id in self.fixture.loaded_pages[0]:
+            self.fixture.deferred["thread/turns/list", thread_id] = history
+        metadata = self.fixture.deferred["thread/read", "thread"] = asyncio.Queue()
+        with patch("monitor.HISTORY_TIMEOUT", 5):
+            async with self.running_monitor(server_overrides={"timeout_seconds": 5}) as client:
+                for _ in self.fixture.loaded_pages[0]:
+                    await asyncio.wait_for(history.get(), 1)
+                await self.fixture.status(client, "thread", "active", USER_INPUT)
+                response = await asyncio.wait_for(metadata.get(), 1)
+                await self.fixture.status(client, "thread", "active", APPROVAL, USER_INPUT)
+                await self.wait_for(lambda: self.monitor.waiting_flags.get("thread") == {USER_INPUT, APPROVAL})
+                await client.send(response)
+                message = await asyncio.wait_for(self.messages.get(), 1)
+                self.assertIn("Waiting for user input\nWaiting for approval", message)
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(self.fixture.requests["thread/read"], 1)
+
+    async def test_omits_flags_that_resolve_during_a_lookup(self):
+        metadata = self.fixture.deferred["thread/read", "thread"] = asyncio.Queue()
+        async with self.running_monitor(server_overrides={"timeout_seconds": 3}) as client:
+            for remaining in ((APPROVAL,), ()):
+                await self.fixture.status(client, "thread", "active", USER_INPUT, APPROVAL)
+                response = await asyncio.wait_for(metadata.get(), 1)
+                await self.fixture.status(client, "thread", "active", *remaining)
+                await self.wait_for(lambda: self.monitor.waiting_flags.get("thread", set()) == set(remaining))
+                await client.send(response)
+                await self.wait_for(lambda: not self.monitor.action_checks)
+            message = await asyncio.wait_for(self.messages.get(), 1)
+            self.assertIn("Waiting for approval", message)
+            self.assertNotIn("Waiting for user input", message)
+            await self.fixture.status(client, "thread", "active", USER_INPUT)
+            await client.send(await asyncio.wait_for(metadata.get(), 1))
+            self.assertIn("Waiting for user input", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_reconnect_cancels_lookups_and_uses_only_live_waiting_events(self):
+        self.fixture.loaded_pages = [["thread"]]
+        self.fixture.histories["thread"] = [[completion("ongoing", status="inProgress")]]
+        self.fixture.metadata["thread"] = {"status": {"type": "active", "activeFlags": [USER_INPUT, APPROVAL]}}
+        async with self.running_monitor(server_overrides={"timeout_seconds": 3}) as client:
+            await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 1)
+            self.assertEqual(self.fixture.requests["thread/read"], 0)
+            self.assertEqual(self.send.call_count, 0)
+
+            await self.fixture.status(client, "thread", "active", USER_INPUT)
+            self.assertIn("Waiting for user input", await asyncio.wait_for(self.messages.get(), 1))
+            metadata = self.fixture.deferred["thread/read", "thread"] = asyncio.Queue()
+            await self.fixture.status(client, "thread", "active", USER_INPUT, APPROVAL)
+            await asyncio.wait_for(metadata.get(), 1)
+            check = self.monitor.action_checks["thread"]
+            rpc = self.monitor.rpc
+            await client.close()
+            await self.wait_for(lambda: not self.monitor.action_checks and not self.monitor.pending_actions)
+            self.assertTrue(check.done())
+            self.assertFalse(rpc.pending)
+            history_count = self.fixture.requests["thread/turns/list"]
+
+            reconnected = await asyncio.wait_for(self.fixture.clients.get(), 3)
+            await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] > history_count)
+            self.assertEqual(self.fixture.requests["thread/read"], 2)
+            self.assertEqual(self.send.call_count, 1)
+            del self.fixture.deferred["thread/read", "thread"]
+            await self.fixture.status(reconnected, "thread", "active", USER_INPUT, APPROVAL)
+            message = await asyncio.wait_for(self.messages.get(), 1)
+            self.assertIn("Waiting for user input\nWaiting for approval", message)
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_action_alerts_apply_project_archive_and_ephemeral_filters(self):
+        self.fixture.metadata = {
+            "excluded": {"cwd": "/projects/hidden", "list_missing": True},
+            "archived": {"archived": True},
+            "ephemeral": {"ephemeral": True},
+        }
+        options = {"excluded_project_paths": ["/projects/hidden/"], "thread_url_template": "codex://{thread_id}"}
+        async with self.running_monitor(notification=options) as client:
+            for thread_id in ("excluded", "archived", "ephemeral", "allowed"):
+                await self.fixture.status(client, thread_id, "active", APPROVAL)
+            await self.wait_for(lambda: len(self.monitor.waiting_flags) == 4 and not self.monitor.action_checks)
+            self.assertIn("codex://allowed", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_action_alerts_share_lookup_policy_and_delivery_settings(self):
+        self.fixture.metadata = {
+            "missing": {"read_failure": True, "list_missing": True},
+            "temporary": {"archived": True, "ephemeral": True},
+        }
+        options = {
+            "include_project": False, "title": "Codex Work", "thread_url_template": "codex://threads/{thread_id}",
+        }
+        for policy in ("notify", "skip", "error"):
+            with self.subTest(policy=policy):
+                level = "ERROR" if policy == "error" else "WARNING"
+                with self.assertLogs("notify", level) as logs, patch("notifications.send_telegram") as telegram:
+                    async with self.running_monitor(
+                        notification=options,
+                        server_overrides={"on_lookup_failure": policy, "skip_ephemeral": False, "skip_archived": False},
+                        telegram={"enabled": True},
+                    ) as client:
+                        for thread_id in ("missing", "temporary"):
+                            await self.fixture.status(client, thread_id, "active", USER_INPUT)
+                        await self.wait_for(lambda: len(self.monitor.waiting_flags) == 2 and not self.monitor.action_checks)
+                    links = ["temporary", "missing"] if policy == "notify" else ["temporary"]
+                    expected = [
+                        f"🔔 Codex Work - Action required\n\nWaiting for user input\n\n🔗 Thread: codex://threads/{name}"
+                        for name in links
+                    ]
+                    self.assertCountEqual([telegram_call.args[1] for telegram_call in telegram.call_args_list], expected)
+                    self.assertEqual(self.messages.qsize(), len(expected))
+                    self.assertCountEqual([self.messages.get_nowait() for _ in expected], expected)
+                self.assertIn(f"on_lookup_failure={policy}", "\n".join(logs.output))
 
     async def test_checks_delayed_history_and_ignores_older_and_unsuccessful_turns(self):
         previous = completion("old", completed_at=self.startup)

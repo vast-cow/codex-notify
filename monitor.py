@@ -1,4 +1,4 @@
-"""Discover, confirm, and deduplicate turn completions."""
+"""Monitor live waiting states and confirm turn completions."""
 
 import asyncio
 import logging
@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 
 from app_server import AppServerError, ConnectionLost, RpcError, lookup_thread, pages
-from notifications import is_turn_duration_filtered
+from notifications import WAITING_LABELS, is_turn_duration_filtered
 
 
 HISTORY_TIMEOUT = 30
@@ -40,6 +40,9 @@ class Monitor:
         self.pending = {}
         self.processed = set()
         self.scans = {}
+        self.waiting_flags = {}
+        self.pending_actions = {}
+        self.action_checks = {}
         self.rpc = None
         self.loading = None
 
@@ -63,6 +66,7 @@ class Monitor:
         state = status.get("type")
         if state not in ("active", "idle", "systemError", "notLoaded"):
             return
+        self.update_waiting_flags(thread_id, status.get("activeFlags") if state == "active" else None)
         if self.loading is not None:
             self.loading[thread_id] = state
         if state == "notLoaded":
@@ -74,6 +78,39 @@ class Monitor:
         else:
             since = self.active_since.pop(thread_id, self.started_at)
             self.schedule(thread_id, since=since)
+
+    def update_waiting_flags(self, thread_id, active_flags):
+        previous = self.waiting_flags.pop(thread_id, set())
+        pending = self.pending_actions.pop(thread_id, set())
+        if not isinstance(active_flags, list):
+            return
+        flags = {flag for flag in WAITING_LABELS if flag in active_flags}
+        if flags:
+            self.waiting_flags[thread_id] = flags
+        # Keep only unresolved flags and add flags that became active in this event.
+        pending = (pending & flags) | (flags - previous)
+        if pending:
+            self.pending_actions[thread_id] = pending
+            self.schedule_action_check(thread_id)
+
+    def schedule_action_check(self, thread_id):
+        if self.rpc is not None and thread_id not in self.action_checks:
+            self.action_checks[thread_id] = asyncio.create_task(self.check_action_required(thread_id))
+
+    async def check_action_required(self, thread_id):
+        try:
+            async with self.action_slots:
+                if thread_id not in self.pending_actions:
+                    return
+                metadata = await self.notification_metadata(thread_id)
+            # Status updates can clear or add flags while the metadata is being fetched.
+            flags = self.pending_actions.pop(thread_id, set())
+            if flags and metadata is not None:
+                self.notifier.notify_action_required(thread_id, metadata.cwd, flags)
+        except ConnectionLost:
+            pass
+        finally:
+            self.action_checks.pop(thread_id, None)
 
     async def sync_loaded(self, status_changes):
         previously_known = self.loaded | self.active_since.keys() | self.pending.keys()
@@ -100,6 +137,7 @@ class Monitor:
 
     async def run(self):
         self.slots = asyncio.Semaphore(8)
+        self.action_slots = asyncio.Semaphore(8)
         delay = 1
         try:
             while True:
@@ -108,19 +146,26 @@ class Monitor:
                     async with self.transport.open(self.on_status, self.settings.timeout_seconds) as rpc:
                         self.rpc = rpc
                         try:
+                            for thread_id in self.pending_actions:
+                                self.schedule_action_check(thread_id)
                             await self.sync_loaded(status_changes)
                             delay = 1
                             log.info("Monitoring shared app-server")
                             await rpc.wait_closed()
                         finally:
                             self.rpc = None
-                            for scan in self.scans.values():
-                                scan.cancel()
-                            await asyncio.gather(*self.scans.values(), return_exceptions=True)
+                            checks = (*self.scans.values(), *self.action_checks.values())
+                            for check in checks:
+                                check.cancel()
+                            await asyncio.gather(*checks, return_exceptions=True)
                             self.scans.clear()
+                            self.action_checks.clear()
                 except (AppServerError, OSError, asyncio.TimeoutError) as exc:
                     reason = str(exc) if isinstance(exc, AppServerError) else type(exc).__name__
                     log.warning("App-server unavailable (%s). Reconnecting in %s s", reason, delay)
+                finally:
+                    self.waiting_flags.clear()
+                    self.pending_actions.clear()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
         finally:
@@ -217,11 +262,14 @@ class Monitor:
     async def process_turn(self, thread_id, turn):
         if is_turn_duration_filtered(turn.get("durationMs"), self.notifier.min_turn_duration):
             return
-        metadata = await lookup_thread(
-            self.rpc, self.settings, thread_id, check_goal=self.notifier.skip_active_goals,
-        )
+        metadata = await self.notification_metadata(thread_id, check_goal=self.notifier.skip_active_goals)
+        if metadata is not None:
+            self.notifier.notify(thread_id, metadata.cwd, turn)
+
+    async def notification_metadata(self, thread_id, *, check_goal=False):
+        metadata = await lookup_thread(self.rpc, self.settings, thread_id, check_goal=check_goal)
         if self.notifier.is_project_excluded(metadata.cwd):
-            log.info("Skipped turn from an excluded project")
+            log.info("Skipped notification from an excluded project")
             return
 
         states = {}
@@ -229,11 +277,11 @@ class Monitor:
             states["ephemeral thread"] = metadata.ephemeral
         if self.settings.skip_archived:
             states["archived thread"] = metadata.archived
-        if self.notifier.skip_active_goals:
+        if check_goal:
             states["active goal"] = metadata.active_goal
         for name, state in states.items():
             if state is True:
-                log.info("Skipped turn due to %s", name)
+                log.info("Skipped notification due to %s", name)
                 return
 
         unknown = [name for name, state in states.items() if state is None]
@@ -249,4 +297,4 @@ class Monitor:
             )
             if action != "notify":
                 return
-        self.notifier.notify(thread_id, metadata.cwd, turn)
+        return metadata

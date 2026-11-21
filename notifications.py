@@ -14,6 +14,10 @@ from pathlib import Path
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 MIN_TURN_DURATION_KEY = "min_turn_duration_minutes"
+WAITING_LABELS = {
+    "waitingOnUserInput": "Waiting for user input",
+    "waitingOnApproval": "Waiting for approval or MCP input",
+}
 log = logging.getLogger("notify")
 
 
@@ -112,6 +116,25 @@ def truncate(text, max_length):
     return text[: max_length - 1] + "…"
 
 
+def project_lines(cwd, options):
+    if options.get("include_project", True) and cwd:
+        return [f"\n📁 Project: {Path(cwd).name}", f"📂 Path: {cwd}"]
+    return []
+
+
+def thread_link_lines(thread_id, options):
+    template = options.get("thread_url_template", "")
+    if (
+        isinstance(template, str)
+        and template.strip()
+        and isinstance(thread_id, str)
+        and thread_id.strip()
+    ):
+        url = template.replace("{thread_id}", thread_id)
+        return [f"\n🔗 Thread: {url}"]
+    return []
+
+
 def format_message(event, config):
     options = config.get("notification", {})
 
@@ -124,12 +147,7 @@ def format_message(event, config):
         return str(text or "")
 
     lines = [f"✅ {title} - Task done"]
-
-    if options.get("include_project", True):
-        cwd = event.get("cwd", "")
-        if cwd:
-            lines.append(f"\n📁 Project: {Path(cwd).name}")
-            lines.append(f"📂 Path: {cwd}")
+    lines.extend(project_lines(event.get("cwd"), options))
 
     if options.get("include_input", True):
         inputs = event.get("input-messages", [])
@@ -148,17 +166,7 @@ def format_message(event, config):
                 + body_text(output)
             )
 
-    template = options.get("thread_url_template", "")
-    thread_id = event.get("thread-id")
-    if (
-        isinstance(template, str)
-        and template.strip()
-        and isinstance(thread_id, str)
-        and thread_id.strip()
-    ):
-        url = template.replace("{thread_id}", thread_id)
-        lines.append(f"\n🔗 Thread: {url}")
-
+    lines.extend(thread_link_lines(event.get("thread-id"), options))
     return "\n".join(lines)
 
 
@@ -261,6 +269,18 @@ class Notifier:
 
     def notify(self, thread_id, cwd, turn):
         message = format_message(event_from_summary(thread_id, cwd, turn), self.config)
+        self.send(message)
+
+    def notify_action_required(self, thread_id, cwd, flags):
+        options = self.config.get("notification", {})
+        title = options.get("title", "Codex CLI")
+        lines = [f"🔔 {title} - Action required", ""]
+        lines.extend(label for flag, label in WAITING_LABELS.items() if flag in flags)
+        lines.extend(project_lines(cwd, options))
+        lines.extend(thread_link_lines(thread_id, options))
+        self.send("\n".join(lines))
+
+    def send(self, message):
         for name, sender in (("Telegram", send_telegram), ("Slack", send_slack)):
             target = self.config.get(name.lower(), {})
             if target.get("enabled", False):
