@@ -249,7 +249,8 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             for remaining in ((APPROVAL,), ()):
                 await self.fixture.status(client, "thread", "active", USER_INPUT, APPROVAL)
                 response = await asyncio.wait_for(metadata.get(), 1)
-                await self.fixture.status(client, "thread", "active", *remaining)
+                state = "active" if remaining else "idle"
+                await self.fixture.status(client, "thread", state, *remaining)
                 await self.wait_for(lambda: self.monitor.waiting_flags.get("thread", set()) == set(remaining))
                 await client.send(response)
                 await self.wait_for(lambda: not self.monitor.action_checks)
@@ -259,6 +260,25 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.fixture.status(client, "thread", "active", USER_INPUT)
             await client.send(await asyncio.wait_for(metadata.get(), 1))
             self.assertIn("Waiting for user input", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_malformed_active_status_does_not_clear_a_pending_flag(self):
+        metadata = self.fixture.deferred["thread/read", "thread"] = asyncio.Queue()
+        async with self.running_monitor(server_overrides={"timeout_seconds": 3}) as client:
+            await self.fixture.status(client, "thread", "active", USER_INPUT)
+            response = await asyncio.wait_for(metadata.get(), 1)
+            await client.send(json.dumps({
+                "method": "thread/status/changed",
+                "params": {"threadId": "thread", "status": {"type": "active", "activeFlags": None}},
+            }))
+            await client.send(response)
+            self.assertIn("Waiting for user input", await asyncio.wait_for(self.messages.get(), 1))
+            await self.fixture.status(client, "thread", "active", USER_INPUT)
+            await self.fixture.status(client, "thread", "active", USER_INPUT, APPROVAL)
+            await client.send(await asyncio.wait_for(metadata.get(), 1))
+            message = await asyncio.wait_for(self.messages.get(), 1)
+            self.assertIn("Waiting for approval", message)
+            self.assertNotIn("Waiting for user input", message)
         self.assertEqual(self.send.call_count, 2)
 
     async def test_reconnect_cancels_lookups_and_uses_only_live_waiting_events(self):

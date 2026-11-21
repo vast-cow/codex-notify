@@ -66,7 +66,7 @@ class Monitor:
         state = status.get("type")
         if state not in ("active", "idle", "systemError", "notLoaded"):
             return
-        self.update_waiting_flags(thread_id, status.get("activeFlags") if state == "active" else None)
+        self.update_waiting_flags(thread_id, status.get("activeFlags") if state == "active" else [])
         if self.loading is not None:
             self.loading[thread_id] = state
         if state == "notLoaded":
@@ -80,10 +80,10 @@ class Monitor:
             self.schedule(thread_id, since=since)
 
     def update_waiting_flags(self, thread_id, active_flags):
-        previous = self.waiting_flags.pop(thread_id, set())
-        pending = self.pending_actions.pop(thread_id, set())
         if not isinstance(active_flags, list):
             return
+        previous = self.waiting_flags.pop(thread_id, set())
+        pending = self.pending_actions.pop(thread_id, set())
         flags = {flag for flag in WAITING_LABELS if flag in active_flags}
         if flags:
             self.waiting_flags[thread_id] = flags
