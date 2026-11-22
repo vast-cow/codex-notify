@@ -92,7 +92,7 @@ def thread_link_lines(thread_id, options):
     return []
 
 
-def format_message(event, config):
+def format_message(event, config, *, goal=None):
     options = config.get("notification", {})
 
     title = options.get("title", "Codex CLI")
@@ -103,10 +103,17 @@ def format_message(event, config):
             return truncate(text, max_length)
         return str(text or "")
 
-    lines = [f"✅ {title} - Task done"]
+    if goal is None:
+        lines = [f"✅ {title} - Task done"]
+    elif goal.status == "complete":
+        lines = [f"✅ {title} - Goal completed", f"\nState: {goal.status}"]
+    else:
+        lines = [f"⚠️ {title} - Goal interrupted", f"\nReason: {goal.status}"]
     lines.extend(project_lines(event.get("cwd"), options))
 
-    if options.get("include_input", True):
+    if goal is not None:
+        lines.append("\n🎯 Goal:\n" + body_text(goal.objective))
+    elif options.get("include_input", True):
         inputs = event.get("input-messages", [])
         if isinstance(inputs, list) and inputs:
             input_text = "\n".join(str(item) for item in inputs)
@@ -210,9 +217,7 @@ class Notifier:
         options = config.get("notification", {})
         self.config = config
         self.excluded_paths = excluded_paths(options)
-        self.skip_active_goals = options.get("skip_active_goals", True)
-        if not isinstance(self.skip_active_goals, bool):
-            raise ValueError("notification.skip_active_goals must be a boolean")
+        self.include_output = options.get("include_output", True)
         timeout_error = "notification.timeout_seconds must be a finite positive number"
         try:
             self.timeout = float(options.get("timeout_seconds", 10))
@@ -233,6 +238,12 @@ class Notifier:
     def notify(self, thread_id, cwd, turn):
         message = format_message(event_from_summary(thread_id, cwd, turn), self.config)
         self.send(message, notification_type="completion", thread_id=thread_id, turn_id=turn.get("id"))
+
+    def notify_goal(self, thread_id, cwd, goal, turn_id, output):
+        event = {"thread-id": thread_id, "cwd": cwd, "last-assistant-message": output}
+        message = format_message(event, self.config, goal=goal)
+        notification_type = "goal_completed" if goal.status == "complete" else "goal_interrupted"
+        self.send(message, notification_type=notification_type, thread_id=thread_id, turn_id=turn_id)
 
     def notify_action_required(self, thread_id, cwd, flags):
         options = self.config.get("notification", {})

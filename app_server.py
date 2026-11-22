@@ -79,7 +79,34 @@ class ThreadMetadata:
     ephemeral: Optional[bool] = None
     archived: Optional[bool] = None
     failures: List[str] = field(default_factory=list)
-    active_goal: Optional[bool] = None
+
+
+def timestamp(value):
+    if type(value) is int or (type(value) is float and math.isfinite(value)):
+        return value
+    return None
+
+
+@dataclass(frozen=True)
+class Goal:
+    status: str
+    objective: str
+    created_at: int
+    updated_at: int
+
+    @classmethod
+    def parse(cls, value, thread_id):
+        if isinstance(value, dict) and value.get("threadId") == thread_id:
+            status, objective = value.get("status"), value.get("objective")
+            created = timestamp(value.get("createdAt"))
+            updated = timestamp(value.get("updatedAt"))
+            if (
+                status in GOAL_STATUSES and isinstance(objective, str)
+                and created is not None and updated is not None
+            ):
+                created, updated = math.floor(created), math.floor(updated)
+                return cls(status, objective, created, max(created, updated))
+        raise AppServerError("malformed or mismatched Goal")
 
 
 class AppServerError(Exception):
@@ -97,6 +124,11 @@ class ThreadIdentityError(AppServerError):
 class RpcError(AppServerError):
     def __init__(self, method, code, message):
         self.code = code
+        self.goal_unavailable = method == "thread/goal/get" and (
+            code == -32601 or (code == -32600 and (
+                message == "goals feature is disabled" or message.startswith("ephemeral thread does not support goals:")
+            ))
+        )
         self.ephemeral_history = (
             method == "thread/turns/list" and code == -32600
             and message == "ephemeral threads do not support thread/turns/list"
@@ -151,10 +183,10 @@ class WebSocketClient:
             self.options.update(unix=True, path=endpoint[len("unix://"):])
 
     @asynccontextmanager
-    async def open(self, on_status, timeout):
+    async def open(self, on_notification, timeout):
         try:
             async with self.connect(self.uri, **self.options) as connection:
-                rpc = RpcClient(connection, self.connection_closed, on_status, timeout)
+                rpc = RpcClient(connection, self.connection_closed, on_notification, timeout)
                 try:
                     await rpc.initialize()
                     yield rpc
@@ -172,10 +204,10 @@ class WebSocketClient:
 
 
 class RpcClient:
-    def __init__(self, connection, connection_closed, on_status, timeout):
+    def __init__(self, connection, connection_closed, on_notification, timeout):
         self.connection = connection
         self.connection_closed = connection_closed
-        self.on_status = on_status
+        self.on_notification = on_notification
         self.timeout = timeout
         self.next_id = 1
         self.pending = {}
@@ -236,9 +268,8 @@ class RpcClient:
                 if not isinstance(message, dict) or message.get("jsonrpc", "2.0") != "2.0":
                     raise ConnectionLost("malformed JSON-RPC message")
                 if "method" in message:
-                    # Status notifications arrive independently of outstanding history requests.
-                    if "id" not in message and message["method"] == "thread/status/changed":
-                        self.on_status(message.get("params"))
+                    if "id" not in message:
+                        self.on_notification(message["method"], message.get("params"))
                     continue
                 request_id = message.get("id")
                 response = self.pending.get(request_id) if type(request_id) is int else None
@@ -293,7 +324,7 @@ def _check_thread(thread, thread_id, *expected_cwds):
     return cwd
 
 
-async def lookup_thread(rpc, settings, thread_id, *, check_goal):
+async def lookup_thread(rpc, settings, thread_id):
     metadata = ThreadMetadata()
 
     async def lookup(method, params):
@@ -345,17 +376,17 @@ async def lookup_thread(rpc, settings, thread_id, *, check_goal):
     except ThreadIdentityError as exc:
         return ThreadMetadata(failures=[str(exc)])
 
-    if check_goal and not (settings.skip_archived and metadata.archived is True):
-        result = await lookup("thread/goal/get", {"threadId": thread_id})
-        if isinstance(result, dict) and "goal" in result:
-            goal = result["goal"]
-            if goal is None:
-                metadata.active_goal = False
-            elif (
-                isinstance(goal, dict) and goal.get("status") in GOAL_STATUSES
-                and goal.get("threadId") == thread_id
-            ):
-                metadata.active_goal = goal["status"] == "active"
-        if result is not None and metadata.active_goal is None:
-            metadata.failures.append("malformed or mismatched thread/goal/get result")
     return metadata
+
+
+async def lookup_goal(rpc, thread_id):
+    try:
+        result = await rpc.request("thread/goal/get", {"threadId": thread_id})
+    except RpcError as exc:
+        if exc.goal_unavailable:
+            return None
+        raise
+    if not isinstance(result, dict) or "goal" not in result:
+        raise AppServerError("malformed thread/goal/get result")
+    goal = result["goal"]
+    return Goal.parse(goal, thread_id) if goal is not None else None

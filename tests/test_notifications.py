@@ -124,9 +124,9 @@ class FilterTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "excluded_project_paths"):
                 notifications.Notifier({"notification": {"excluded_project_paths": value}})
 
-    def test_goal_filter_requires_a_boolean(self):
-        with self.assertRaisesRegex(ValueError, "skip_active_goals"):
-            notifications.Notifier({"notification": {"skip_active_goals": "true"}})
+    def test_legacy_goal_filter_is_ignored(self):
+        notifier = notifications.Notifier({"notification": {"skip_active_goals": "legacy"}})
+        self.assertTrue(notifier.include_output)
 
     def test_invalid_numeric_configuration_names_the_setting_without_echoing_the_value(self):
         for setting in ("timeout_seconds", "max_output_length"):

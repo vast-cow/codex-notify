@@ -44,6 +44,14 @@ The monitor sends `🔔 Codex CLI - Action required` to the enabled Telegram and
 
 Each flag alerts once while it stays active. Once it clears, a later occurrence can alert again. Metadata lookups run alongside history checks. If the flags change during a lookup, the monitor sends one message for the newly observed flags that are still active when the lookup finishes.
 
+## Goal notifications
+
+Live `thread/goal/updated` events generate `Goal completed` for `complete` and `Goal interrupted` for `blocked`, `usageLimited`, or `budgetLimited`. The message includes the state, the Goal statement, configured project information, and any configured thread link. If `notification.include_output` is enabled and the event identifies a turn, the monitor waits up to 30 seconds for its final response in history. The notification still goes out if the response is unavailable.
+
+Each stop state alerts once per period of Goal execution. Resuming a Goal lets it alert again. Pausing or deleting a Goal resumes ordinary completion notifications for turns that start afterward. The monitor suppresses `Task done` for Goal turns, including turns whose second-resolution timestamps leave their association with a Goal ambiguous. `Action required` alerts also work during Goals.
+
+The app-server must enable `features.goals` to send Goal events. When the Goal API is disabled or unsupported, ordinary turns still generate notifications.
+
 ## Notification filters
 
 The monitor confirms a turn's result using `thread/turns/list` and evaluates successfully completed turns for notification regardless of their duration. It uses the text from the persisted user messages and the last non-commentary assistant message in the summary. Formatting, truncation, thread links, and destination settings use the same configuration keys as v1. See [config.example.json](../config.example.json) for the full set of options.
@@ -53,8 +61,7 @@ The monitor confirms a turn's result using `thread/turns/list` and evaluates suc
 | `notification.excluded_project_paths` | `[]` | Suppresses exact working-directory matches after expanding `~` and normalizing paths. |
 | `app_server.skip_ephemeral` | `true` | Suppresses known ephemeral threads. Completion notifications require readable history even when this filter is disabled. |
 | `app_server.skip_archived` | `true` | Suppresses archived threads. Archive membership requires an exact thread ID match in `thread/list`. |
-| `notification.skip_active_goals` | `true` | Suppresses completion notifications when the Goal is `active` after history confirms completion. Enable `features.goals` in the app-server's Codex configuration or turn off this filter. |
-| `app_server.on_lookup_failure` | `notify` | If the working directory or an enabled filter state is unknown, `notify` logs the issue and proceeds, `skip` suppresses the notification, and `error` suppresses it and logs an error. Monitoring continues. A confirmed exclusion takes precedence. |
+| `app_server.on_lookup_failure` | `notify` | If the working directory, an enabled filter state, or the Goal state for a turn is unknown, `notify` logs the issue and proceeds, `skip` suppresses the notification, and `error` suppresses it and logs an error. Monitoring continues. A confirmed exclusion takes precedence. |
 | `app_server.timeout_seconds` | `1.5` | Timeout for connection setup and each app-server request. |
 | `notification.timeout_seconds` | `10` | HTTP timeout for each enabled destination. |
 
@@ -64,6 +71,7 @@ Telegram and Slack send independently, so a failure on one leaves the other deli
 
 - `thread/status/changed` signals a history check when a thread becomes idle, unloads, or reports a system error. The monitor requires `status=completed` and `completedAt` strictly later than its startup time. Codex reports timestamps to the second, so a turn in the startup second can fall outside the cutoff. [Codex Turn schema](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/app-server-protocol/schema/typescript/v2/Turn.ts)
 - The monitor rechecks history for up to 30 seconds from the first lookup when a completion has yet to appear or completion signals overlap. Startup and reconnects also recheck during this window because a completion can be delayed even when an earlier turn is already visible. Startup uses the threads returned by `thread/loaded/list`. Reconnects use currently loaded threads, previously known threads, and pending checks.
-- A disconnect cancels pending waiting-state lookups and clears the observed flags. Startup and reconnection snapshots are used for completion history only. Action-required notifications resume when the new connection receives live waiting flags.
+- Startup and reconnection use `thread/goal/get` for turn classification. Only live Goal updates generate Goal notifications. The monitor retains received Goal updates and continues waiting for their results across reconnects within the original deadline.
+- A disconnect cancels pending waiting-state lookups and clears the observed flags. Action-required notifications resume when the new connection receives live waiting flags.
 - Reconnect delays increase from 1 second to a maximum of 30 seconds and reset after a successful loaded-thread check. A thread that starts and unloads entirely during a disconnect can be missed.
 - Completion deduplication uses the pair of thread ID and turn ID in memory for the lifetime of the process. Use a single monitor per set of destinations. Stopping the monitor clears its deduplication state, and restarting establishes a new startup cutoff.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor a shared Codex app-server for completed turns and requests for action."""
+"""Monitor a shared Codex app-server for turn completions, Goal updates, and requests for action."""
 
 import argparse
 import asyncio

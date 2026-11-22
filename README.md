@@ -18,4 +18,4 @@ Run a persistent monitor for Telegram and Slack notifications from a shared Code
    codex --remote ws://127.0.0.1:8765
    ```
 
-[Unix socket setup, notification filters, and reconnection behavior](docs/monitoring.md)
+[Unix socket setup, Goal notifications, filters, and reconnection behavior](docs/monitoring.md)

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 
-from app_server import RpcError, Settings, SOURCE_KINDS, lookup_thread
+from app_server import AppServerError, Goal, RpcError, Settings, SOURCE_KINDS, lookup_goal, lookup_thread
 
 
 ENDPOINT = "ws://127.0.0.1:8765"
@@ -47,21 +47,20 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
         rpc = AsyncMock()
         rpc.request.side_effect = [
             {"thread": dict(row, ephemeral=False)}, {"data": [{"id": "different"}]},
-            {"data": [row]}, {"goal": None},
+            {"data": [row]},
         ]
-        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread", check_goal=True)
-        self.assertEqual((metadata.cwd, metadata.ephemeral, metadata.archived, metadata.active_goal),
-                         ("/project", False, False, False))
+        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread")
+        self.assertEqual((metadata.cwd, metadata.ephemeral, metadata.archived), ("/project", False, False))
         archive = rpc.request.call_args_list[1].args
         self.assertEqual(archive, ("thread/list", {
             "archived": True, "includedThreadIds": ["thread"], "sourceKinds": list(SOURCE_KINDS),
             "modelProviders": [], "limit": 1,
         }))
 
-    async def test_ephemeral_short_circuits_archive_and_goal(self):
+    async def test_ephemeral_short_circuits_archive_lookup(self):
         rpc = AsyncMock()
         rpc.request.return_value = {"thread": {"id": "thread", "cwd": "/project", "ephemeral": True}}
-        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread", check_goal=True)
+        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread")
         self.assertIs(metadata.ephemeral, True)
         rpc.request.assert_awaited_once_with("thread/read", {"threadId": "thread", "includeTurns": False})
 
@@ -71,7 +70,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             RpcError("thread/read", -32601, "unavailable"),
             {"data": [{"id": "thread", "cwd": "/project"}]},
         ]
-        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread", check_goal=True)
+        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread")
         self.assertIsNone(metadata.ephemeral)
         self.assertIs(metadata.archived, True)
         self.assertEqual(rpc.request.await_count, 2)
@@ -79,7 +78,7 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabling_metadata_filters_still_looks_up_cwd(self):
         rpc = AsyncMock()
         rpc.request.return_value = {"thread": {"id": "thread", "cwd": "/project"}}
-        metadata = await lookup_thread(rpc, Settings(ENDPOINT, False, False), "thread", check_goal=False)
+        metadata = await lookup_thread(rpc, Settings(ENDPOINT, False, False), "thread")
         self.assertEqual(metadata.cwd, "/project")
         rpc.request.assert_awaited_once()
 
@@ -89,38 +88,33 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
             {"thread": {"id": "thread", "cwd": "/project", "ephemeral": False}},
             {"data": [{"id": "thread", "cwd": "/different"}]},
         ]
-        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread", check_goal=True)
+        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread")
         self.assertIsNone(metadata.cwd)
         self.assertIsNone(metadata.ephemeral)
         self.assertIn("working directory", metadata.failures[0])
 
     async def test_goal_states_require_matching_thread(self):
-        for goal, expected in (
-            (None, False),
-            *[({"threadId": "thread", "status": status}, status == "active") for status in
-              ("active", "complete", "blocked", "paused", "usageLimited", "budgetLimited")],
-            ({"threadId": "other", "status": "active"}, None),
-            ({"threadId": "thread", "status": "unknown"}, None),
-        ):
-            with self.subTest(goal=goal):
-                rpc = AsyncMock()
-                rpc.request.side_effect = [
-                    {"thread": {"id": "thread", "cwd": "/project"}}, {"goal": goal},
-                ]
-                metadata = await lookup_thread(rpc, Settings(ENDPOINT, False, False), "thread",
-                                               check_goal=True)
-                self.assertIs(metadata.active_goal, expected)
-                rpc.request.assert_awaited_with("thread/goal/get", {"threadId": "thread"})
+        rpc = AsyncMock()
+        fields = {"threadId": "thread", "objective": "Finish", "createdAt": 1, "updatedAt": 2}
+        for status in ("active", "complete", "blocked", "paused", "usageLimited", "budgetLimited"):
+            with self.subTest(status=status):
+                rpc.request.return_value = {"goal": dict(fields, status=status)}
+                self.assertEqual(await lookup_goal(rpc, "thread"), Goal(status, "Finish", 1, 2))
+        for invalid in ({"threadId": "other"}, {"status": "unknown"}, {"createdAt": None}):
+            with self.subTest(invalid=invalid), self.assertRaises(AppServerError):
+                rpc.request.return_value = {"goal": {**fields, "status": "active", **invalid}}
+                await lookup_goal(rpc, "thread")
+        rpc.request.return_value = {"goal": None}
+        self.assertIsNone(await lookup_goal(rpc, "thread"))
+        rpc.request.assert_awaited_with("thread/goal/get", {"threadId": "thread"})
 
-    async def test_timeout_and_unsupported_metadata_are_unknown(self):
+    async def test_metadata_timeout_leaves_archive_state_unknown(self):
         rpc = AsyncMock()
         rpc.request.side_effect = [
             {"thread": {"id": "thread", "cwd": "/project", "ephemeral": False}},
             asyncio.TimeoutError,
             {"data": [{"id": "different"}]},
-            RpcError("thread/goal/get", -32601, "private text"),
         ]
-        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread", check_goal=True)
+        metadata = await lookup_thread(rpc, Settings(ENDPOINT), "thread")
         self.assertIsNone(metadata.archived)
-        self.assertIsNone(metadata.active_goal)
-        self.assertEqual(metadata.failures, ["thread/list timed out", "thread/goal/get is unsupported"])
+        self.assertEqual(metadata.failures, ["thread/list timed out"])
