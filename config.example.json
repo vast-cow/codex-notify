@@ -23,7 +23,6 @@
     "endpoint": "ws://127.0.0.1:8765",
     "skip_ephemeral": true,
     "skip_archived": true,
-    "timeout_seconds": 1.5,
-    "on_lookup_failure": "notify"
+    "timeout_seconds": 1.5
   }
 }
