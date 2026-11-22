@@ -290,6 +290,24 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(lambda: (thread_id, "goal") in self.monitor.processed)
         self.assertEqual(self.send.call_count, 1)
 
+    async def test_history_preceding_all_live_goal_updates_uses_the_persisted_goal(self):
+        thread_id = "thread"
+        self.fixture.loaded_pages = [[thread_id]]
+        created_at = int(self.startup) + 2
+        stopped = goal_snapshot(thread_id, "complete", created_at, created_at + 1)
+        async with self.running_monitor() as client:
+            await self.wait_for(lambda: thread_id in self.monitor.goals)
+            self.fixture.metadata[thread_id] = {"goal": stopped}
+            self.fixture.histories[thread_id] = [[
+                completion("goal", started_at=created_at, completed_at=created_at + 1),
+            ]]
+            await self.wait_for(lambda: (thread_id, "goal") in self.monitor.processed)
+            await self.monitor.notifier.drain()
+            self.assertTrue(self.messages.empty())
+            await self.fixture.goal(client, thread_id, stopped, "goal")
+            self.assertIn("Goal completed", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
+
     async def test_live_stop_wins_over_in_flight_snapshot_and_only_live_updates_notify(self):
         thread_id = "thread"
         created_at = int(self.startup) + 2
@@ -319,13 +337,49 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             stale = await asyncio.wait_for(snapshot.get(), 1)
             await self.fixture.goal(client, thread_id, None)
             await self.wait_for(lambda: thread_id in self.monitor.goals)
-            cleared_at = self.monitor.goals[thread_id].periods[-1][1]
+            cleared_at = int(time.time())
             self.fixture.histories[thread_id] = [[
                 completion("after-clear", started_at=cleared_at + 1, completed_at=cleared_at + 2),
                 completion("before-clear", started_at=created_at, completed_at=cleared_at),
             ]]
             await client.send(stale)
             self.assertIn("request after-clear", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_resume_clear_snapshot_without_a_goal_does_not_suppress_a_turn(self):
+        thread_id = "thread"
+        self.fixture.histories[thread_id] = [[self.recent("normal", started_at=int(self.startup) + 2)]]
+        async with self.running_monitor() as client:
+            await self.fixture.goal(client, thread_id, None)
+            await self.fixture.status(client, thread_id, "idle")
+            self.assertIn("request normal", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_resume_snapshot_of_a_goal_stopped_before_startup_does_not_alert(self):
+        thread_id = "thread"
+        created_at = int(self.startup) - 3
+        stopped = goal_snapshot(thread_id, "complete", created_at, created_at + 1)
+        self.fixture.histories[thread_id] = [[self.recent("normal", started_at=int(self.startup) + 2)]]
+        async with self.running_monitor() as client:
+            await self.fixture.goal(client, thread_id, stopped)
+            await self.fixture.status(client, thread_id, "idle")
+            self.assertIn("request normal", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_goal_boundary_can_be_recovered_for_turns_with_duration_but_no_start_time(self):
+        thread_id = "thread"
+        created_at = int(self.startup) + 2
+        stopped_at = created_at + 2
+        stopped = goal_snapshot(thread_id, "complete", created_at, stopped_at)
+        self.fixture.loaded_pages = [[thread_id]]
+        self.fixture.metadata[thread_id] = {"goal": stopped}
+        self.fixture.histories[thread_id] = [[
+            completion("normal", completed_at=stopped_at + 4, duration=1_000),
+            completion("ambiguous", completed_at=stopped_at + 1, duration=1_000),
+        ]]
+        async with self.running_monitor():
+            self.assertIn("request normal", await asyncio.wait_for(self.messages.get(), 1))
+            await self.wait_for(lambda: len(self.monitor.processed) == 2)
         self.assertEqual(self.send.call_count, 1)
 
     async def test_pause_clear_and_resume_allow_normal_turns_between_execution_periods(self):
@@ -368,12 +422,34 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Reason: blocked\n\n🎯 Goal:\nFinish the migration", message)
             self.assertNotIn("Project:", message)
             self.assertNotIn("Result:", message)
+            await self.fixture.goal(client, thread_id, goal_snapshot(thread_id, "active", created_at))
+            await self.fixture.goal(client, thread_id, first_stop, "goal")
             await self.fixture.goal(client, thread_id, goal_snapshot(thread_id, "active", created_at, created_at + 3))
             await self.fixture.goal(client, thread_id, second_stop, "goal-2")
             self.assertEqual(await asyncio.wait_for(self.messages.get(), 1), message)
             await self.fixture.goal(client, thread_id, second_stop, "goal-2")
             await self.wait_for(lambda: not self.monitor.goal_notifications)
             self.assertEqual(self.fixture.requests["thread/turns/list"], 0)
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_resumed_goal_renotifies_when_history_reveals_the_next_stop_first(self):
+        thread_id = "thread"
+        created_at = int(self.startup) + 2
+        first_stop = goal_snapshot(thread_id, "blocked", created_at, created_at + 1)
+        resumed = goal_snapshot(thread_id, "active", created_at, created_at + 2)
+        second_stop = goal_snapshot(thread_id, "blocked", created_at, created_at + 3)
+        async with self.running_monitor(notification={"include_output": False}) as client:
+            await self.fixture.goal(client, thread_id, first_stop, "first")
+            self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
+            self.fixture.metadata[thread_id]["goal"] = second_stop
+            self.fixture.histories[thread_id] = [[
+                completion("second", started_at=created_at + 2, completed_at=created_at + 3),
+            ]]
+            await self.fixture.status(client, thread_id, "idle")
+            await self.wait_for(lambda: (thread_id, "second") in self.monitor.processed)
+            await self.fixture.goal(client, thread_id, resumed)
+            await self.fixture.goal(client, thread_id, second_stop, "second")
+            self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
         self.assertEqual(self.send.call_count, 2)
 
     async def test_goal_result_waits_for_the_matching_final_response(self):
@@ -464,22 +540,82 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 completion("normal", started_at=stopped_at + 1, completed_at=stopped_at + 2),
                 completion("goal", started_at=created_at, completed_at=stopped_at),
             ]]
-            await asyncio.wait_for(self.fixture.clients.get(), 3)
+            reconnected = await asyncio.wait_for(self.fixture.clients.get(), 3)
             self.assertIn("request normal", await asyncio.wait_for(self.messages.get(), 1))
+            await self.fixture.goal(reconnected, thread_id, self.fixture.metadata[thread_id]["goal"])
+            await self.fixture.status(reconnected, thread_id, "active", USER_INPUT)
+            self.assertIn("Action required", await asyncio.wait_for(self.messages.get(), 1))
+            await self.monitor.notifier.drain()
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_goal_resumed_during_disconnect_can_notify_the_same_stop_again(self):
+        thread_id = "thread"
+        created_at = int(self.startup) + 2
+        self.fixture.loaded_pages = [[thread_id]]
+        async with self.running_monitor(notification={"include_output": False}) as client:
+            await self.fixture.goal(client, thread_id, goal_snapshot(thread_id, "blocked", created_at), "first")
+            self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
+            await client.close()
+            self.fixture.metadata[thread_id]["goal"] = goal_snapshot(thread_id, "active", created_at, created_at + 1)
+            reconnected = await asyncio.wait_for(self.fixture.clients.get(), 3)
+            await self.wait_for(lambda: self.monitor.goals[thread_id].notification_goal.status == "active")
+            await self.fixture.goal(
+                reconnected, thread_id, goal_snapshot(thread_id, "blocked", created_at, created_at + 2), "second",
+            )
+            self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_live_stop_with_turn_id_can_follow_a_matching_goal_snapshot(self):
+        thread_id = "thread"
+        created_at = int(self.startup) + 2
+        stopped = goal_snapshot(thread_id, "blocked", created_at, created_at + 1)
+        self.fixture.loaded_pages = [[thread_id]]
+        self.fixture.metadata[thread_id] = {"goal": stopped}
+        async with self.running_monitor(notification={"include_output": False}) as client:
+            await self.wait_for(lambda: thread_id in self.monitor.goals)
+            await self.fixture.goal(client, thread_id, stopped, "goal")
+            self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_live_stop_without_turn_id_can_follow_a_fresh_goal_snapshot(self):
+        thread_id = "thread"
+        stopped = goal_snapshot(thread_id, "blocked", int(time.time()))
+        self.fixture.loaded_pages = [[thread_id]]
+        self.fixture.metadata[thread_id] = {"goal": stopped}
+        async with self.running_monitor() as client:
+            await self.wait_for(lambda: thread_id in self.monitor.goals)
+            await self.fixture.goal(client, thread_id, stopped)
+            self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
         self.assertEqual(self.send.call_count, 1)
 
     async def test_disabled_or_unsupported_goal_api_allows_normal_turns_under_error_policy(self):
-        self.fixture.loaded_pages = [["disabled", "unsupported"]]
+        self.fixture.loaded_pages = [["disabled", "unsupported", "legacy-unsupported"]]
         self.fixture.metadata = {
             "disabled": {"goal_failure": "goals feature is disabled"},
             "unsupported": {"goal_failure": "Method not found"},
+            "legacy-unsupported": {"goal_failure": "Invalid request: unknown variant `thread/goal/get`, expected ..."},
         }
         self.fixture.histories = {thread_id: [[self.recent(thread_id)]] for thread_id in self.fixture.metadata}
         async with self.running_monitor(server_overrides={"on_lookup_failure": "error"}):
-            messages = [await asyncio.wait_for(self.messages.get(), 1) for _ in range(2)]
+            messages = [await asyncio.wait_for(self.messages.get(), 1) for _ in range(3)]
             self.assertCountEqual([message.split("request ")[1].splitlines()[0] for message in messages],
-                                  ["disabled", "unsupported"])
-        self.assertEqual(self.send.call_count, 2)
+                                  ["disabled", "unsupported", "legacy-unsupported"])
+        self.assertEqual(self.send.call_count, 3)
+
+    async def test_transient_goal_lookup_failure_recovers_on_next_turn(self):
+        thread_id = "thread"
+        self.fixture.metadata[thread_id] = {"goal_failure": "private Goal lookup failure"}
+        self.fixture.histories[thread_id] = [[self.recent("first")]]
+        async with self.running_monitor(server_overrides={"on_lookup_failure": "error"}) as client:
+            await self.wait_for(lambda: self.monitor.loading is None)
+            await self.fixture.status(client, thread_id, "idle")
+            await self.wait_for(lambda: (thread_id, "first") in self.monitor.processed)
+            self.assertTrue(self.messages.empty())
+            self.fixture.metadata[thread_id].clear()
+            self.fixture.histories[thread_id][0].insert(0, self.recent("second"))
+            await self.fixture.status(client, thread_id, "idle")
+            self.assertIn("request second", await asyncio.wait_for(self.messages.get(), 1))
+        self.assertEqual(self.send.call_count, 1)
 
     async def test_suppresses_repeated_flags_until_each_resolves(self):
         async with self.running_monitor() as client:
@@ -849,7 +985,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                     )
                     await self.monitor.notifier.drain()
                 self.assertEqual(self.send.call_count - before, expected + 1)
-        self.assertEqual(self.fixture.requests["thread/goal/get"], 9)
+        self.assertEqual(self.fixture.requests["thread/goal/get"], 6)
 
     async def test_slow_delivery_does_not_block_events_or_another_destination(self):
         release = threading.Event()

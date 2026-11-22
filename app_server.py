@@ -94,6 +94,9 @@ class Goal:
     created_at: int
     updated_at: int
 
+    def is_older_than(self, other):
+        return (self.created_at, self.updated_at) < (other.created_at, other.updated_at)
+
     @classmethod
     def parse(cls, value, thread_id):
         if isinstance(value, dict) and value.get("threadId") == thread_id:
@@ -126,7 +129,9 @@ class RpcError(AppServerError):
         self.code = code
         self.goal_unavailable = method == "thread/goal/get" and (
             code == -32601 or (code == -32600 and (
-                message == "goals feature is disabled" or message.startswith("ephemeral thread does not support goals:")
+                message == "goals feature is disabled"
+                or message.startswith("ephemeral thread does not support goals:")
+                or message.startswith("Invalid request: unknown variant `thread/goal/get`,")
             ))
         )
         self.ephemeral_history = (

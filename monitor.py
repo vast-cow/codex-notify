@@ -33,15 +33,37 @@ class Check:
     reconcile: bool
 
 
+@dataclass(frozen=True)
+class GoalLookup:
+    check: Optional[Check] = None
+    failure: Optional[str] = None
+
+
 @dataclass
 class GoalExecution:
     goal: Optional[Goal] = None
     active_since: Optional[int] = None
+    cleared_at: Optional[int] = None
     periods: list = field(default_factory=list)
     turn_ids: set = field(default_factory=set)
+    notification_goal: Optional[Goal] = None
     notified_stops: set = field(default_factory=set)
 
-    def update(self, goal, observed_at, disconnected_at):
+    def is_stale(self, goal):
+        if self.goal is None:
+            return self.cleared_at is not None and goal.updated_at < self.cleared_at
+        return goal.is_older_than(self.goal)
+
+    def update_notification_state(self, goal):
+        previous = self.notification_goal
+        if goal is not None and previous is not None and goal.is_older_than(previous):
+            return False
+        if goal is None or previous is None or goal.created_at != previous.created_at or goal.status == "active":
+            self.notified_stops.clear()
+        self.notification_goal = goal
+        return True
+
+    def update(self, goal, observed_at, uncertain_since):
         previous = self.goal
         same_goal = previous is not None and goal is not None and previous.created_at == goal.created_at
         active = goal is not None and goal.status == "active"
@@ -54,18 +76,18 @@ class GoalExecution:
             self.active_since = None
         if active and self.active_since is None:
             self.active_since = goal.updated_at if same_goal else goal.created_at
-            if same_goal and disconnected_at is not None:
-                self.active_since = min(self.active_since, max(previous.updated_at, disconnected_at))
+            if same_goal and uncertain_since is not None:
+                self.active_since = min(self.active_since, max(previous.updated_at, uncertain_since))
         elif goal is not None and not same_goal:
             self.periods.append((goal.created_at, goal.updated_at))
-        elif goal is not None and disconnected_at is not None and not active and previous.status != "active":
-            # A changed snapshot may cover a resume and another stop during the outage.
+        elif goal is not None and uncertain_since is not None and not active and previous.status != "active":
+            # A changed snapshot may cover a resume and another stop before the live updates arrive.
             if goal.updated_at > previous.updated_at:
-                start = min(goal.updated_at, max(previous.updated_at, disconnected_at))
+                start = min(goal.updated_at, max(previous.updated_at, uncertain_since))
                 self.periods.append((start, goal.updated_at))
-        if not same_goal or active:
-            self.notified_stops.clear()
         self.goal = goal
+        if goal is not None:
+            self.cleared_at = None
 
     def turn_membership(self, turn):
         """Return None while the turn might be waiting for a Goal stop update."""
@@ -74,6 +96,10 @@ class GoalExecution:
         started = timestamp(turn.get("startedAt"))
         started = math.floor(started) if started is not None else None
         completed = math.floor(turn["completedAt"])
+        duration = turn.get("durationMs")
+        if started is None and type(duration) is int and duration >= 0:
+            # Allow for both the second-resolution completion and the rounded duration.
+            started = completed - duration // 1000 - 1
         for start, end in self.periods:
             if completed >= start and (started is None or started <= end):
                 return True
@@ -102,6 +128,7 @@ class Monitor:
         self.goals = {}
         self.goal_lookups = {}
         self.goal_notifications = set()
+        self.goal_events_since = math.floor(started_at)
         self.disconnected_at = None
         self.rpc = None
         self.loading = None
@@ -136,42 +163,71 @@ class Monitor:
         turn_id = params.get("turnId") if not cleared else None
         if not isinstance(turn_id, str) or not turn_id:
             turn_id = None
-        execution = self.record_goal(thread_id, goal, cleared=cleared)
+        execution = self.goals.get(thread_id)
+        stale = goal is not None and execution is not None and execution.is_stale(goal)
+        if not stale:
+            lookup = self.goal_lookups.get(thread_id)
+            uncertain_since = self.disconnected_at if lookup is None else None
+            execution = self.record_goal(thread_id, goal, uncertain_since, cleared=cleared)
+            self.goal_lookups[thread_id] = GoalLookup(lookup.check if lookup else None)
         if turn_id is not None:
             execution.turn_ids.add(turn_id)
-        if goal is not None and goal.status in GOAL_STOP_STATUSES and goal.status not in execution.notified_stops:
-            execution.notified_stops.add(goal.status)
-            deadline = asyncio.get_running_loop().time() + HISTORY_TIMEOUT
-            task = asyncio.create_task(self.process_goal(thread_id, goal, turn_id, deadline))
-            self.goal_notifications.add(task)
-            task.add_done_callback(self.goal_notifications.discard)
+        if goal is None:
+            execution.update_notification_state(None)
+            return
+        if execution.goal is None or goal.created_at != execution.goal.created_at:
+            return
+        # History snapshots may already reflect a later state while live transitions are queued.
+        if not execution.update_notification_state(goal):
+            return
+        if goal.status not in GOAL_STOP_STATUSES or goal.status in execution.notified_stops:
+            return
+        # Codex also broadcasts the persisted Goal without a turn ID when a client resumes a thread.
+        if turn_id is None and goal.updated_at < self.goal_events_since:
+            return
+        execution.notified_stops.add(goal.status)
+        deadline = asyncio.get_running_loop().time() + HISTORY_TIMEOUT
+        task = asyncio.create_task(self.process_goal(thread_id, goal, turn_id, deadline))
+        self.goal_notifications.add(task)
+        task.add_done_callback(self.goal_notifications.discard)
 
-    def record_goal(self, thread_id, goal, *, cleared=False):
+    def record_goal(self, thread_id, goal, uncertain_since, *, cleared=False):
         observed_at = math.floor(time.time())
-        execution = self.goals.get(thread_id)
-        if execution is None:
-            execution = self.goals[thread_id] = GoalExecution()
-            if cleared:
-                # A clear has no timestamp or Goal details when it beats the initial snapshot.
-                execution.periods.append((math.floor(self.started_at), observed_at))
-        disconnected_at = self.disconnected_at if thread_id not in self.goal_lookups else None
-        execution.update(goal, observed_at, disconnected_at)
-        self.goal_lookups[thread_id] = None
+        execution = self.goals.setdefault(thread_id, GoalExecution())
+        if cleared and execution.cleared_at is None:
+            execution.cleared_at = observed_at
+        execution.update(goal, observed_at, uncertain_since)
         return execution
 
-    async def sync_goal(self, thread_id):
-        if thread_id in self.goal_lookups:
-            return
+    async def sync_goal(self, thread_id, check):
+        execution = self.goals.get(thread_id)
+        previous = execution.goal if execution else None
+        uncertain_since = previous.updated_at if previous is not None else None
+        reconnecting = thread_id not in self.goal_lookups and self.disconnected_at is not None
+        if reconnecting:
+            uncertain_since = self.disconnected_at
+        # A live update replaces this marker and takes precedence over the RPC response.
+        pending = GoalLookup(check)
+        self.goal_lookups[thread_id] = pending
         try:
             goal = await lookup_goal(self.rpc, thread_id)
         except ConnectionLost:
             raise
         except (AppServerError, asyncio.TimeoutError) as exc:
-            self.goal_lookups.setdefault(thread_id, str(exc) or "thread/goal/get timed out")
+            if self.goal_lookups[thread_id] is pending:
+                self.goal_lookups[thread_id] = GoalLookup(check, str(exc) or "thread/goal/get timed out")
         else:
-            # A live update received while the snapshot was in flight takes precedence.
-            if thread_id not in self.goal_lookups:
-                self.record_goal(thread_id, goal)
+            if self.goal_lookups[thread_id] is pending:
+                if goal is None or execution is None or not execution.is_stale(goal):
+                    execution = self.record_goal(thread_id, goal, uncertain_since)
+                    if reconnecting and (goal is None or goal.status == "active"):
+                        execution.update_notification_state(goal)
+            elif goal is not None and previous is None:
+                cleared_at = self.goals[thread_id].cleared_at
+                if cleared_at is not None and goal.updated_at <= cleared_at:
+                    # The snapshot supplies evidence of a Goal before the clear without reopening it.
+                    end = cleared_at if goal.status == "active" else goal.updated_at
+                    self.goals[thread_id].periods.append((goal.created_at, end))
 
     def on_status(self, params):
         if not isinstance(params, dict):
@@ -261,6 +317,8 @@ class Monitor:
         try:
             while True:
                 status_changes = self.loading = {}
+                if self.disconnected_at is not None:
+                    self.goal_events_since = math.floor(time.time())
                 try:
                     async with self.transport.open(self.on_notification, self.settings.timeout_seconds) as rpc:
                         self.rpc = rpc
@@ -308,7 +366,6 @@ class Monitor:
                 try:
                     async with self.slots:
                         check = self.pending[thread_id]
-                        await self.sync_goal(thread_id)
                         if check is not last_check:
                             last_check = check
                             # Queueing behind other threads must not consume the first attempt.
@@ -316,7 +373,7 @@ class Monitor:
                             confirmed = False
                             log.debug("Turn history check started (reconcile=%s)", check.reconcile, extra=context)
                         observed, unresolved = await self.scan_history(
-                            thread_id, check.since, deadline, incomplete_turns,
+                            thread_id, check, deadline, incomplete_turns,
                         )
                     confirmed |= observed
                     retry = check.reconcile or unresolved or not confirmed
@@ -358,11 +415,17 @@ class Monitor:
             self.scans.pop(thread_id, None)
             log.debug("Turn history check ended", extra=context)
 
-    async def scan_history(self, thread_id, since, deadline, incomplete_turns):
+    async def scan_history(self, thread_id, check, deadline, incomplete_turns):
+        since = check.since
         confirmed = False
         unresolved = False
         malformed = False
+        goal_checked = False
         async for rows in turn_history(self.rpc, thread_id, deadline):
+            lookup = self.goal_lookups.get(thread_id)
+            if not goal_checked and (lookup is None or lookup.check is not check):
+                await self.sync_goal(thread_id, check)
+                goal_checked = True
             reached_startup = False
             # Process each page before requesting the next one so an older page
             # failing cannot suppress completions already confirmed by history.
@@ -393,6 +456,10 @@ class Monitor:
                 log.debug("Turn history found a terminal turn (status=%s)", status,
                           extra={"thread_id": thread_id, "turn_id": turn_id})
                 if status == "completed":
+                    if not goal_checked:
+                        # New history may appear before the corresponding live Goal update.
+                        await self.sync_goal(thread_id, check)
+                        goal_checked = True
                     if await self.process_turn(thread_id, turn) is False:
                         unresolved = True
                         if deadline - asyncio.get_running_loop().time() > POLL_INTERVAL:
@@ -423,7 +490,7 @@ class Monitor:
             self.skip_goal_turn(thread_id, turn["id"])
         elif membership is None:
             return False
-        elif self.allow_notification(thread_id, turn["id"], metadata, goal_failure=self.goal_lookups.get(thread_id)):
+        elif self.allow_notification(thread_id, turn["id"], metadata, goal_failure=self.goal_lookups[thread_id].failure):
             self.notifier.notify(thread_id, metadata.cwd, turn)
 
     def goal_membership(self, thread_id, turn):
