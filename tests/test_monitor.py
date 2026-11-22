@@ -127,8 +127,9 @@ class Fixture:
             "method": "thread/status/changed", "params": {"threadId": thread_id, "status": status},
         }))
 
-    async def goal(self, client, thread_id, goal, turn_id=None):
-        self.metadata.setdefault(thread_id, {})["goal"] = goal
+    async def goal(self, client, thread_id, goal, turn_id=None, *, persist=True):
+        if persist:
+            self.metadata.setdefault(thread_id, {})["goal"] = goal
         method = "thread/goal/updated" if goal else "thread/goal/cleared"
         params = {"threadId": thread_id}
         if goal:
@@ -398,7 +399,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.fixture.goal(client, thread_id, goal_snapshot(thread_id, "active", created_at, created_at + 4))
             await self.fixture.goal(client, thread_id, None)
             await self.wait_for(lambda: self.monitor.goals[thread_id].goal is None)
-            cleared_at = self.monitor.goals[thread_id].periods[-1][1]
+            cleared_at = self.monitor.goals[thread_id].periods[-1].end
             self.fixture.histories[thread_id] = [[
                 completion("cleared", started_at=cleared_at + 1, completed_at=cleared_at + 2),
                 completion("before-clear", started_at=created_at + 5, completed_at=cleared_at),
@@ -451,6 +452,48 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.fixture.goal(client, thread_id, second_stop, "second")
             self.assertIn("Goal interrupted", await asyncio.wait_for(self.messages.get(), 1))
         self.assertEqual(self.send.call_count, 2)
+
+    async def test_live_stop_notifies_when_history_already_shows_a_replacement_goal(self):
+        thread_id = "thread"
+        created_at = int(self.startup) + 2
+        first = goal_snapshot(thread_id, "active", created_at, objective="First objective")
+        replacement = goal_snapshot(thread_id, "active", created_at + 5, objective="Replacement")
+        stopped = {**first, "status": "complete", "updatedAt": created_at + 2}
+        async with self.running_monitor(notification={"include_output": False}) as client:
+            await self.fixture.goal(client, thread_id, first, "first")
+            await self.wait_for(lambda: thread_id in self.monitor.goals)
+            self.fixture.metadata[thread_id]["goal"] = replacement
+            self.fixture.histories[thread_id] = [[
+                completion("between", started_at=created_at + 3, completed_at=created_at + 4),
+                completion("first", started_at=created_at, completed_at=created_at + 2),
+            ]]
+            await self.fixture.status(client, thread_id, "idle")
+            await self.wait_for(lambda: (thread_id, "first") in self.monitor.processed)
+            self.assertTrue(self.messages.empty())
+            await self.fixture.goal(client, thread_id, stopped, "first", persist=False)
+            messages = [await asyncio.wait_for(self.messages.get(), 1) for _ in range(2)]
+            self.assertTrue(any("Goal completed" in message and "First objective" in message for message in messages))
+            self.assertTrue(any("Task done" in message and "request between" in message for message in messages))
+        self.assertEqual(self.send.call_count, 2)
+
+    async def test_delayed_clear_does_not_end_a_replacement_goal_already_in_history(self):
+        thread_id = "thread"
+        created_at = int(self.startup) + 2
+        first = goal_snapshot(thread_id, "active", created_at)
+        replacement = goal_snapshot(thread_id, "active", created_at + 3)
+        async with self.running_monitor() as client:
+            await self.fixture.goal(client, thread_id, first)
+            await self.wait_for(lambda: thread_id in self.monitor.goals)
+            self.fixture.metadata[thread_id]["goal"] = replacement
+            await self.fixture.status(client, thread_id, "idle")
+            await self.wait_for(lambda: self.monitor.goals[thread_id].goal.created_at == created_at + 3)
+            await self.fixture.goal(client, thread_id, None, persist=False)
+            await self.fixture.goal(client, thread_id, None, persist=False)
+            await self.fixture.goal(client, thread_id, replacement, persist=False)
+            await self.fixture.status(client, thread_id, "active", USER_INPUT)
+            self.assertIn("Action required", await asyncio.wait_for(self.messages.get(), 1))
+            self.assertEqual(self.monitor.goals[thread_id].active_since, created_at + 3)
+        self.assertEqual(self.send.call_count, 1)
 
     async def test_goal_result_waits_for_the_matching_final_response(self):
         thread_id = "thread"

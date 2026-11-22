@@ -40,6 +40,13 @@ class GoalLookup:
 
 
 @dataclass
+class GoalPeriod:
+    start: int
+    end: int
+    awaiting_stop: Optional[int] = None
+
+
+@dataclass
 class GoalExecution:
     goal: Optional[Goal] = None
     active_since: Optional[int] = None
@@ -53,6 +60,13 @@ class GoalExecution:
         if self.goal is None:
             return self.cleared_at is not None and goal.updated_at < self.cleared_at
         return goal.is_older_than(self.goal)
+
+    def clear_may_precede_snapshot(self):
+        previous = self.notification_goal
+        return self.goal is not None and (
+            self.cleared_at is not None
+            or (previous is not None and previous.created_at < self.goal.created_at)
+        )
 
     def update_notification_state(self, goal):
         previous = self.notification_goal
@@ -68,26 +82,35 @@ class GoalExecution:
         same_goal = previous is not None and goal is not None and previous.created_at == goal.created_at
         active = goal is not None and goal.status == "active"
         if self.active_since is not None and (not active or not same_goal):
+            awaiting_stop = None
             if goal is None:
-                end = observed_at
+                end = self.cleared_at if self.cleared_at is not None else observed_at
             else:
                 end = goal.updated_at if same_goal else goal.created_at
-            self.periods.append((self.active_since, max(self.active_since, end)))
+                if not same_goal:
+                    awaiting_stop = previous.created_at
+            self.periods.append(GoalPeriod(self.active_since, max(self.active_since, end), awaiting_stop))
             self.active_since = None
         if active and self.active_since is None:
             self.active_since = goal.updated_at if same_goal else goal.created_at
             if same_goal and uncertain_since is not None:
                 self.active_since = min(self.active_since, max(previous.updated_at, uncertain_since))
         elif goal is not None and not same_goal:
-            self.periods.append((goal.created_at, goal.updated_at))
+            self.periods.append(GoalPeriod(goal.created_at, goal.updated_at))
         elif goal is not None and uncertain_since is not None and not active and previous.status != "active":
             # A changed snapshot may cover a resume and another stop before the live updates arrive.
             if goal.updated_at > previous.updated_at:
                 start = min(goal.updated_at, max(previous.updated_at, uncertain_since))
-                self.periods.append((start, goal.updated_at))
+                self.periods.append(GoalPeriod(start, goal.updated_at))
         self.goal = goal
         if goal is not None:
             self.cleared_at = None
+
+    def confirm_end(self, goal):
+        for period in self.periods:
+            if period.awaiting_stop == goal.created_at:
+                period.end = max(period.start, min(period.end, goal.updated_at))
+                period.awaiting_stop = None
 
     def turn_membership(self, turn):
         """Return None while the turn might be waiting for a Goal stop update."""
@@ -100,15 +123,18 @@ class GoalExecution:
         if started is None and type(duration) is int and duration >= 0:
             # Allow for both the second-resolution completion and the rounded duration.
             started = completed - duration // 1000 - 1
-        for start, end in self.periods:
-            if completed >= start and (started is None or started <= end):
-                return True
+        uncertain = False
+        for period in self.periods:
+            if completed >= period.start and (started is None or started <= period.end):
+                if period.awaiting_stop is None:
+                    return True
+                uncertain = True
         if self.active_since is not None and completed >= self.active_since:
             # The row can become visible before the stop update establishes the boundary.
             if completed <= self.goal.updated_at:
                 return True
             return None
-        return False
+        return None if uncertain else False
 
 
 class Monitor:
@@ -167,19 +193,27 @@ class Monitor:
         stale = goal is not None and execution is not None and execution.is_stale(goal)
         if not stale:
             lookup = self.goal_lookups.get(thread_id)
-            uncertain_since = self.disconnected_at if lookup is None else None
-            execution = self.record_goal(thread_id, goal, uncertain_since, cleared=cleared)
+            if cleared and execution is not None and execution.clear_may_precede_snapshot():
+                # A clear carries no Goal identity. Keep the newer snapshot until another observation.
+                if execution.cleared_at is None:
+                    execution.cleared_at = math.floor(time.time())
+            else:
+                uncertain_since = self.disconnected_at if lookup is None else None
+                execution = self.record_goal(thread_id, goal, uncertain_since, cleared=cleared)
             self.goal_lookups[thread_id] = GoalLookup(lookup.check if lookup else None)
         if turn_id is not None:
             execution.turn_ids.add(turn_id)
         if goal is None:
             execution.update_notification_state(None)
             return
-        if execution.goal is None or goal.created_at != execution.goal.created_at:
+        known_goals = (execution.goal, execution.notification_goal)
+        if not any(known is not None and known.created_at == goal.created_at for known in known_goals):
             return
         # History snapshots may already reflect a later state while live transitions are queued.
         if not execution.update_notification_state(goal):
             return
+        if goal.status != "active":
+            execution.confirm_end(goal)
         if goal.status not in GOAL_STOP_STATUSES or goal.status in execution.notified_stops:
             return
         # Codex also broadcasts the persisted Goal without a turn ID when a client resumes a thread.
@@ -227,7 +261,7 @@ class Monitor:
                 if cleared_at is not None and goal.updated_at <= cleared_at:
                     # The snapshot supplies evidence of a Goal before the clear without reopening it.
                     end = cleared_at if goal.status == "active" else goal.updated_at
-                    self.goals[thread_id].periods.append((goal.created_at, end))
+                    self.goals[thread_id].periods.append(GoalPeriod(goal.created_at, end))
 
     def on_status(self, params):
         if not isinstance(params, dict):
