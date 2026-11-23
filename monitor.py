@@ -14,6 +14,7 @@ from notifications import WAITING_LABELS, event_from_summary
 
 
 HISTORY_TIMEOUT = 30
+COMPLETION_LOOKBACK = 30
 POLL_INTERVAL = 1
 MAX_RECONNECT_DELAY = 30
 TERMINAL_STATUSES = ("completed", "failed", "interrupted")
@@ -143,6 +144,7 @@ class Monitor:
         self.transport = transport
         self.notifier = notifier
         self.started_at = started_at
+        self.connection_since = started_at
         self.loaded = set()
         self.active_since = {}
         self.pending = {}
@@ -160,10 +162,11 @@ class Monitor:
         self.loading = None
 
     def schedule(self, thread_id, *, since, reconcile=False):
+        since = max(since, self.connection_since)
         old_check = self.pending.get(thread_id)
         if old_check is not None:
-            since = max(since, old_check.since)
-            # Overlapping signals can refer to different turns with the same timestamp.
+            since = min(since, old_check.since)
+            # Overlapping signals can refer to different turns that become visible separately.
             reconcile = True
         self.pending[thread_id] = Check(since, reconcile)
         if self.rpc is not None and thread_id not in self.scans:
@@ -273,6 +276,7 @@ class Monitor:
         state = status.get("type")
         if state not in ("active", "idle", "systemError", "notLoaded"):
             return
+        received_at = math.floor(time.time())
         self.update_waiting_flags(thread_id, status.get("activeFlags") if state == "active" else [])
         log.debug("Thread status changed: state=%s waiting_flags=%s",
                   state, sorted(self.waiting_flags.get(thread_id, ())), extra={"thread_id": thread_id})
@@ -283,10 +287,13 @@ class Monitor:
         else:
             self.loaded.add(thread_id)
         if state == "active":
-            self.active_since.setdefault(thread_id, math.floor(time.time()))
+            self.active_since.setdefault(thread_id, received_at)
         else:
-            since = self.active_since.pop(thread_id, self.started_at)
-            self.schedule(thread_id, since=since)
+            since = self.active_since.pop(thread_id, None)
+            if since is None:
+                self.schedule(thread_id, since=received_at - COMPLETION_LOOKBACK, reconcile=True)
+            else:
+                self.schedule(thread_id, since=since)
 
     def update_waiting_flags(self, thread_id, active_flags):
         if not isinstance(active_flags, list):
@@ -337,8 +344,7 @@ class Monitor:
         self.loading = None
         self.loaded = current
         for thread_id in current | previously_known | self.pending.keys():
-            since = self.active_since.get(thread_id, self.started_at)
-            self.schedule(thread_id, since=since, reconcile=True)
+            self.schedule(thread_id, since=self.connection_since, reconcile=True)
         self.active_since = {
             thread_id: since for thread_id, since in self.active_since.items()
             if thread_id in current
@@ -355,6 +361,20 @@ class Monitor:
                     self.goal_events_since = math.floor(time.time())
                 try:
                     async with self.transport.open(self.on_notification, self.settings.timeout_seconds) as rpc:
+                        connected_at = math.floor(time.time())
+                        since = max(self.started_at, connected_at - COMPLETION_LOOKBACK)
+                        if self.disconnected_at is not None:
+                            since = max(since, self.disconnected_at)
+                        self.connection_since = since
+                        # Rebase unfinished work before live checks can merge with it.
+                        self.pending = {
+                            thread_id: Check(max(check.since, since), check.reconcile)
+                            for thread_id, check in self.pending.items()
+                        }
+                        self.active_since = {
+                            thread_id: max(active_at, since)
+                            for thread_id, active_at in self.active_since.items()
+                        }
                         self.rpc = rpc
                         try:
                             for thread_id in self.pending_actions:
@@ -468,8 +488,8 @@ class Monitor:
                     malformed = True
                     continue
                 completed_at = timestamp(turn.get("completedAt"))
-                if completed_at is not None and completed_at <= self.started_at:
-                    reached_startup = True
+                if completed_at is not None and completed_at < since:
+                    reached_startup |= completed_at < self.started_at
                     continue
                 turn_id = turn["id"]
                 key = (thread_id, turn_id)
@@ -501,7 +521,7 @@ class Monitor:
                         self.skip_goal_turn(thread_id, turn_id)
                 self.processed.add(key)
                 incomplete_turns.pop(turn_id, None)
-                confirmed |= completed_at >= since
+                confirmed = True
             if reached_startup:
                 # The history is ordered newest-first.
                 break

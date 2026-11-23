@@ -557,8 +557,9 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 await self.fixture.goal(client, thread_id, stopped, "goal")
                 await self.wait_for(lambda: bool(self.monitor.goal_notifications))
                 await client.close()
+                await self.wait_for(lambda: self.monitor.disconnected_at is not None)
                 self.fixture.histories[thread_id] = [[
-                    completion("normal", started_at=stopped_at + 1, completed_at=stopped_at + 2),
+                    completion("normal", started_at=stopped_at + 1, completed_at=self.monitor.disconnected_at),
                     completion("goal", started_at=created_at, completed_at=stopped_at, status="interrupted"),
                 ]]
                 reconnected = await asyncio.wait_for(self.fixture.clients.get(), 3)
@@ -572,12 +573,13 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_reconnect_stop_snapshot_classifies_turns_without_sending_a_goal_alert(self):
         thread_id = "thread"
         created_at = int(self.startup) + 2
-        stopped_at = created_at + 2
         self.fixture.loaded_pages = [[thread_id]]
         self.fixture.metadata[thread_id] = {"goal": goal_snapshot(thread_id, "active", created_at)}
         async with self.running_monitor() as client:
             await self.wait_for(lambda: thread_id in self.monitor.goals)
             await client.close()
+            await self.wait_for(lambda: self.monitor.disconnected_at is not None)
+            stopped_at = self.monitor.disconnected_at
             self.fixture.metadata[thread_id]["goal"] = goal_snapshot(thread_id, "complete", created_at, stopped_at)
             self.fixture.histories[thread_id] = [[
                 completion("normal", started_at=stopped_at + 1, completed_at=stopped_at + 2),
@@ -585,6 +587,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             ]]
             reconnected = await asyncio.wait_for(self.fixture.clients.get(), 3)
             self.assertIn("request normal", await asyncio.wait_for(self.messages.get(), 1))
+            await self.wait_for(lambda: (thread_id, "goal") in self.monitor.processed)
             await self.fixture.goal(reconnected, thread_id, self.fixture.metadata[thread_id]["goal"])
             await self.fixture.status(reconnected, thread_id, "active", USER_INPUT)
             self.assertIn("Action required", await asyncio.wait_for(self.messages.get(), 1))
@@ -815,7 +818,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(f"on_lookup_failure={policy}", "\n".join(logs.output))
 
     async def test_checks_delayed_history_and_ignores_older_and_unsuccessful_turns(self):
-        previous = completion("old", completed_at=self.startup)
+        previous = completion("old", completed_at=self.startup - 1)
         self.fixture.loaded_pages = [["thread"]]
         self.fixture.histories["thread"] = [[previous]]
         async with self.running_monitor() as client:
@@ -836,13 +839,64 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.send.call_count, 1)
 
     async def test_startup_recovers_delayed_history_without_a_status_event(self):
-        previous = completion("old", completed_at=self.startup - 1)
+        self.startup = 10_000.5
+        previous = completion("before-startup", completed_at=10_000)
         self.fixture.loaded_pages = [["thread"]]
         self.fixture.histories["thread"] = [[previous]]
-        async with self.running_monitor():
-            await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 1)
-            self.fixture.histories["thread"] = [[self.recent("startup"), previous]]
-            self.assertIn("request startup", await asyncio.wait_for(self.messages.get(), 0.5))
+        with patch("monitor.time") as clock:
+            clock.time.return_value = 10_010
+            async with self.running_monitor():
+                await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 1)
+                self.fixture.histories["thread"] = [[completion("startup", completed_at=10_001), previous]]
+                self.assertIn("request startup", await asyncio.wait_for(self.messages.get(), 0.5))
+        self.assertEqual(self.send.call_count, 1)
+
+    async def test_regular_completion_uses_first_active_second_and_completion_time(self):
+        now = 30_000
+        self.startup = now - 7 * 3600
+        with patch("monitor.time") as clock:
+            clock.time.return_value = self.startup + 1
+            async with self.running_monitor() as client:
+                await self.wait_for(lambda: self.monitor.loading is None)
+                clock.time.return_value = now - 3600 + 0.9
+                for thread_id in ("idle", "notLoaded", "systemError"):
+                    await self.fixture.status(client, thread_id, "active")
+                await self.wait_for(lambda: len(self.monitor.active_since) == 3)
+                clock.time.return_value = now + 31.9
+                for thread_id in ("idle", "notLoaded", "systemError"):
+                    self.fixture.histories[thread_id] = [[
+                        completion(thread_id, started_at=now - 5 * 3600, completed_at=now),
+                        completion("two-hours-old", completed_at=now - 2 * 3600),
+                        completion("six-hours-old", completed_at=now - 6 * 3600),
+                    ]]
+                    await self.fixture.status(client, thread_id, "active")
+                    await self.fixture.status(client, thread_id, thread_id)
+                messages = [await asyncio.wait_for(self.messages.get(), 1) for _ in range(3)]
+                self.assertCountEqual(
+                    [message.split("request ")[1].splitlines()[0] for message in messages],
+                    ["idle", "notLoaded", "systemError"],
+                )
+                await self.wait_for(lambda: not self.monitor.scans)
+        self.assertEqual(self.send.call_count, 3)
+        self.assertEqual(self.fixture.requests["thread/read"], 3)
+
+    async def test_late_initial_connection_uses_cutoff_captured_before_loaded_snapshot(self):
+        self.startup = 10_000.5
+        connected_at = 10_100
+        loaded = self.fixture.deferred["thread/loaded/list", None] = asyncio.Queue()
+        self.fixture.loaded_pages = [["thread"]]
+        self.fixture.histories["thread"] = [[
+            completion("at-cutoff", completed_at=connected_at - 30),
+            completion("before-cutoff", completed_at=connected_at - 31),
+        ]]
+        with patch("monitor.time") as clock:
+            clock.time.return_value = connected_at + 0.9
+            async with self.running_monitor() as client:
+                snapshot = await asyncio.wait_for(loaded.get(), 1)
+                clock.time.return_value += 60
+                await client.send(snapshot)
+                self.assertIn("request at-cutoff", await asyncio.wait_for(self.messages.get(), 1))
+                await self.wait_for(lambda: not self.monitor.scans)
         self.assertEqual(self.send.call_count, 1)
 
     async def test_reconnect_recovers_previous_and_newly_loaded_threads_once(self):
@@ -854,6 +908,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             await self.fixture.status(client, "gone", "active")
             await self.wait_for(lambda: "gone" in self.monitor.active_since)
             await client.close()
+            await self.wait_for(lambda: self.monitor.disconnected_at is not None)
             self.fixture.loaded_pages = [["still"], ["new"]]
             self.fixture.histories["still"] = [[first], [first]]
             self.fixture.histories["gone"] = [[self.recent("missed-from-gone")]]
@@ -875,6 +930,7 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         async with self.running_monitor() as client:
             await self.wait_for(lambda: self.fixture.requests["thread/loaded/list"] >= 1)
             await client.close()
+            await self.wait_for(lambda: self.monitor.disconnected_at is not None)
             self.fixture.loaded_pages = [["thread"]]
             first = self.recent("already-visible")
             self.fixture.histories["thread"] = [[first]]
@@ -884,12 +940,82 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("request visible-later", await asyncio.wait_for(self.messages.get(), 0.5))
         self.assertEqual(self.send.call_count, 2)
 
+    async def test_reconnect_rebases_running_and_pending_checks(self):
+        self.startup = 10_000
+        for outage in (2, 60):
+            with self.subTest(outage=outage), patch("monitor.time") as clock:
+                self.fixture = Fixture()
+                clock.time.return_value = self.startup + 1
+                async with self.running_monitor(server_overrides={"timeout_seconds": 2}) as client:
+                    await self.wait_for(lambda: self.monitor.loading is None)
+                    await self.fixture.status(client, "running", "active")
+                    await self.fixture.status(client, "pending", "active")
+                    await self.fixture.status(client, "pending", "idle")
+                    await self.wait_for(lambda: "pending" in self.monitor.pending)
+                    clock.time.return_value += 100
+                    await client.close()
+                    await self.wait_for(lambda: self.monitor.disconnected_at is not None)
+                    disconnected_at = self.monitor.disconnected_at
+                    clock.time.return_value = disconnected_at + outage + 0.9
+                    cutoff = disconnected_at + max(0, outage - 30)
+                    self.fixture.loaded_pages = [["running", "new"]]
+                    loaded = self.fixture.deferred["thread/loaded/list", None] = asyncio.Queue()
+                    for thread_id in ("running", "pending", "new"):
+                        self.fixture.histories[thread_id] = [[
+                            completion(thread_id, started_at=self.startup, completed_at=cutoff),
+                            completion("too-old-" + thread_id, completed_at=cutoff - 1),
+                        ]]
+                    reconnected = await asyncio.wait_for(self.fixture.clients.get(), 3)
+                    snapshot = await asyncio.wait_for(loaded.get(), 1)
+                    # Live events can arrive before the recovery snapshot is available.
+                    for thread_id in ("running", "pending"):
+                        await self.fixture.status(reconnected, thread_id, "idle")
+                    messages = [await asyncio.wait_for(self.messages.get(), 1) for _ in range(2)]
+                    self.assertCountEqual(
+                        [message.split("request ")[1].splitlines()[0] for message in messages],
+                        ["running", "pending"],
+                    )
+                    await reconnected.send(snapshot)
+                    self.assertIn("request new", await asyncio.wait_for(self.messages.get(), 1))
+                    await self.wait_for(lambda: not self.monitor.scans)
+                    await self.monitor.notifier.drain()
+                    self.assertTrue(self.messages.empty())
+        self.assertEqual(self.send.call_count, 6)
+
+    async def test_idle_only_checks_keep_receipt_cutoff_through_queueing_and_history_delays(self):
+        self.startup = 10_000.5
+        received_at = 10_300
+        with patch("monitor.time") as clock:
+            clock.time.return_value = self.startup + 1
+            async with self.running_monitor() as client:
+                await self.wait_for(lambda: self.monitor.loading is None)
+                self.monitor.slots = asyncio.Semaphore(0)
+                clock.time.return_value = received_at + 0.9
+                await self.fixture.status(client, "thread", "idle")
+                await self.wait_for(lambda: "thread" in self.monitor.pending)
+                clock.time.return_value += 60
+                self.monitor.slots.release()
+                await self.wait_for(lambda: self.fixture.requests["thread/turns/list"] >= 1)
+                clock.time.return_value += 60
+                first = completion("same-second-first", completed_at=received_at - 30)
+                previous = completion("before-cutoff", completed_at=received_at - 31)
+                self.fixture.histories["thread"] = [[first, previous]]
+                self.assertIn("request same-second-first", await asyncio.wait_for(self.messages.get(), 1))
+                second = completion("same-second-second", completed_at=received_at - 30)
+                self.fixture.histories["thread"] = [[second, first, previous]]
+                self.assertIn("request same-second-second", await asyncio.wait_for(self.messages.get(), 1))
+                await self.wait_for(lambda: not self.monitor.scans)
+        self.assertEqual(self.send.call_count, 2)
+
     async def test_overlapping_status_events_can_refer_to_two_completions_in_one_second(self):
         async with self.running_monitor():
             await self.wait_for(lambda: self.monitor.loading is None)
-            for state in ("active", "idle", "active", "idle"):
-                self.monitor.on_status({"threadId": "thread", "status": {"type": state}})
-            completed_at = time.time()
+            completed_at = int(time.time())
+            with patch("monitor.time") as clock:
+                for active_at in (completed_at, completed_at + 1):
+                    clock.time.return_value = active_at + 0.9
+                    for state in ("active", "idle"):
+                        self.monitor.on_status({"threadId": "thread", "status": {"type": state}})
             first = completion("same-second-first", completed_at=completed_at)
             self.fixture.histories["thread"] = [[first]]
             self.assertIn("request same-second-first", await asyncio.wait_for(self.messages.get(), 2))
